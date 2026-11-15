@@ -529,6 +529,14 @@ mach_msg_overwrite_trap(
 	/* Only accept options allowed by the user */
 	option &= MACH_MSG_OPTION_USER;
 
+#ifdef __DARLING__
+	{
+		// x86Sim (RAM 13): drop the shared entries of memory processes unmapped (duct-tape memory.c)
+		extern void dtape_memory_sweep_tick(void);
+		dtape_memory_sweep_tick();
+	}
+#endif
+
 	if (option & MACH_SEND_MSG) {
 		ipc_space_t space = current_space();
 		ipc_kmsg_t kmsg;

@@ -73,9 +73,16 @@ static bool x86sim_frozen_enabled(void);
 
 #define MFD_CLOEXEC 0x1
 
+// x86Sim: every vm_map, for dtape_memory_sweep_tick (a map is unlinked before it is destroyed)
+extern void x86sim_rpcstat_slot(unsigned slot);
+static struct _vm_map* all_maps;
+static struct _vm_map* sweep_cursor;
+static dtape_mutex_t all_maps_lock;
+
 void dtape_memory_init(void) {
 	dtape_mutex_init(&all_descriptors_lock);
 	dtape_mutex_init(&frozen_lock);
+	dtape_mutex_init(&all_maps_lock);
 
 };
 
@@ -117,6 +124,15 @@ vm_map_t dtape_vm_map_create(struct dtape_task* task) {
 	map->max_entry_size = 0;
 	map->last_prune_ns = 0;
 	dtape_mutex_init(&map->shared_entry_lock);
+
+	dtape_mutex_lock(&all_maps_lock);
+	map->all_next = all_maps;
+	map->all_prev = &all_maps;
+	if (all_maps) {
+		all_maps->all_prev = &map->all_next;
+	}
+	all_maps = map;
+	dtape_mutex_unlock(&all_maps_lock);
 
 	return map;
 };
@@ -303,8 +319,34 @@ static void dtape_map_prune_shared_entries(vm_map_t map) {
 		}
 		RB_REMOVE(dtape_map_shared_entry_head, &map->shared_entries, entry);
 		dtape_map_shared_entry_destroy(entry);
+		x86sim_rpcstat_slot(415); // entries pruned (memory-entry counters, X86SIM_MSTAT below)
 	}
 	dtape_mutex_unlock(&map->shared_entry_lock);
+};
+
+// x86Sim (RAM 13): a map's entries used to be pruned only when that process shared something again, so a process
+// that stopped sharing kept every memfd it had ever shared and since unmapped: on an idle iPhone ~85 MB of
+// memory-entry memfds were mapped by no process and referenced by no memory entry port (lsd's 3 store copies, 25 MB;
+// iosurfaced's IOSurfaces, 14 MB; extensions that had exited their work), on an idle Vision Pro ~20 MB. Every
+// mach_msg ticks this: at most every DTAPE_SWEEP_TICK_NS it prunes the next map of the list of all maps (round
+// robin; a map pruned within DTAPE_PRUNE_INTERVAL_NS is skipped by dtape_map_prune_shared_entries itself), so each
+// map is checked about every (number of processes x tick). A memfd an entry port, another map or an fd still holds
+// keeps its descriptor reference: only the dead entries go, as on XNU, where the pages go with the last mapping.
+#define DTAPE_SWEEP_TICK_NS (200ULL * 1000 * 1000)
+void dtape_memory_sweep_tick(void) {
+	static uint64_t last_tick;
+	uint64_t now = mach_absolute_time();
+	uint64_t last = __atomic_load_n(&last_tick, __ATOMIC_RELAXED);
+	if (now - last < DTAPE_SWEEP_TICK_NS || !__atomic_compare_exchange_n(&last_tick, &last, now, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+		return;
+	}
+	dtape_mutex_lock(&all_maps_lock);
+	vm_map_t map = sweep_cursor ? sweep_cursor : all_maps;
+	if (map) {
+		sweep_cursor = map->all_next;
+		dtape_map_prune_shared_entries(map);
+	}
+	dtape_mutex_unlock(&all_maps_lock);
 };
 
 void dtape_vm_map_destroy(vm_map_t map) {
@@ -314,6 +356,17 @@ void dtape_vm_map_destroy(vm_map_t map) {
 
 	dtape_map_shared_entry_t* entry;
 	dtape_map_shared_entry_t* tmp;
+
+	// x86Sim: out of the sweep's list first (a sweep in progress holds the list lock: it finishes this map before)
+	dtape_mutex_lock(&all_maps_lock);
+	if (sweep_cursor == map) {
+		sweep_cursor = map->all_next;
+	}
+	*map->all_prev = map->all_next;
+	if (map->all_next) {
+		map->all_next->all_prev = map->all_prev;
+	}
+	dtape_mutex_unlock(&all_maps_lock);
 
 	dtape_mutex_lock(&map->shared_entry_lock);
 	RB_FOREACH_SAFE(entry, dtape_map_shared_entry_head, &map->shared_entries, tmp) {

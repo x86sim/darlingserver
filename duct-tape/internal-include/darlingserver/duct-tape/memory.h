@@ -44,6 +44,9 @@ struct _vm_map {
 	uint64_t max_entry_size;
 	// x86Sim: when the entries were last checked against the process's mappings (dtape_map_prune_shared_entries)
 	uint64_t last_prune_ns;
+	// x86Sim: a link in the list of all maps (dtape_memory_sweep_tick checks every map's entries in turn)
+	struct _vm_map* all_next;
+	struct _vm_map** all_prev;
 };
 
 typedef struct _vm_map dtape_map_t;

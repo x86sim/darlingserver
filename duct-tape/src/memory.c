@@ -43,6 +43,7 @@ int memfd_create(const char *name, unsigned int flags);
 int close(int fd);
 int dup(int fd); // x86Sim: dtape_memfd_for_region
 int ftruncate(int fd, off_t length);
+long pwrite(int fd, const void* buf, size_t count, off_t offset); // x86Sim: x86sim_fill_memfd (ssize_t)
 int fstat(int fd, void* buf); // x86Sim: x86_64 struct stat, only st_ino is read
 
 // x86Sim: all shared descriptors, to look them up by inode
@@ -972,6 +973,64 @@ kern_return_t mach_vm_machine_attribute(vm_map_t map, mach_vm_address_t addr, ma
 
 // x86Sim: make [start, start + size) of `map` a shared mapping of a memfd (or find
 // the one it already is) and return it with the byte offset of `start` in it
+// x86Sim (Idle 1): copies [start, start + size) of `map` into the new memfd `fd` (`size` long, all holes), writing
+// only the pages that are not all zero: a hole reads as zeros, so the contents are the same, but the memfd gets no
+// page for them. The whole range used to be copied through a mapping of the memfd, so every untouched page of the
+// region (zero, no memory in the process) became a page of shmem: on an idle Vision Pro ~390 of the 710 MB of memory
+// entries were zero pages (backboardd's 255 MB entry: 192 MB of zeros), charged to the device and in no one's PSS.
+static bool x86sim_zero_page(const uint8_t* p, size_t len) {
+	const uint64_t* w = (const uint64_t*)p;
+	for (size_t k = 0; k < len / 8; k++) {
+		if (w[k]) {
+			return false;
+		}
+	}
+	for (size_t k = len & ~(size_t)7; k < len; k++) {
+		if (p[k]) {
+			return false;
+		}
+	}
+	return true;
+};
+static kern_return_t x86sim_fill_memfd(vm_map_t map, uintptr_t start, int fd, size_t size) {
+	enum { chunk = 256 << 10, page = 4096 };
+	uint8_t* buf = malloc(chunk);
+	if (!buf) {
+		return KERN_RESOURCE_SHORTAGE;
+	}
+	kern_return_t kr = KERN_SUCCESS;
+	for (size_t done = 0; done < size && kr == KERN_SUCCESS; done += chunk) {
+		size_t n = size - done < chunk ? size - done : chunk;
+		kr = copyinmap(map, start + done, buf, n);
+		size_t i = 0;
+		while (i < n && kr == KERN_SUCCESS) {
+			size_t len = n - i < page ? n - i : page;
+			if (x86sim_zero_page(buf + i, len)) {   // left a hole
+				i += len;
+				continue;
+			}
+			size_t j = i + len;   // the run of pages up to the next all-zero one, in one write
+			while (j < n) {
+				size_t l2 = n - j < page ? n - j : page;
+				if (x86sim_zero_page(buf + j, l2)) {
+					break;
+				}
+				j += l2;
+			}
+			while (i < j) {
+				long r = pwrite(fd, buf + i, j - i, (off_t)(done + i));
+				if (r <= 0) {
+					kr = KERN_RESOURCE_SHORTAGE;
+					break;
+				}
+				i += (size_t)r;
+			}
+		}
+	}
+	free(buf);
+	return kr;
+};
+
 static kern_return_t dtape_share_region(vm_map_t map, uintptr_t start, size_t size, dtape_map_shared_descriptor_t** out_descriptor, uint64_t* out_byte_offset, vm_prot_t* out_prot) {
 	dtape_memory_region_info_t region_info;
 	dtape_map_shared_entry_t* existing[8];
@@ -1093,21 +1152,14 @@ static kern_return_t dtape_share_region(vm_map_t map, uintptr_t start, size_t si
 		close(memfd);
 		return KERN_RESOURCE_SHORTAGE;
 	}
-	void* mapped = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
-	if (mapped == MAP_FAILED) {
-		close(memfd);
-		return KERN_RESOURCE_SHORTAGE;
-	}
 	dtape_map_shared_descriptor_t* descriptor = dtape_map_shared_descriptor_create(memfd, size);
 	if (!descriptor) {
-		munmap(mapped, size);
 		close(memfd);
 		return KERN_RESOURCE_SHORTAGE;
 	}
 
 	// same race as in mach_vm_remap_external_shared: writes between the copy and the remap are lost
-	kern_return_t kr = copyinmap(map, start, mapped, size);
-	munmap(mapped, size);
+	kern_return_t kr = x86sim_fill_memfd(map, start, memfd, size);
 	X86SIM_MSTAT(snapshot ? 6 : 5);
 	x86sim_rpcstat_add(411, size >> 10);
 	if (kr == KERN_SUCCESS && snapshot) {

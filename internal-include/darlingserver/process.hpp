@@ -101,7 +101,9 @@ namespace DarlingServer {
 		std::weak_ptr<Process> _parentProcess;
 		bool _startSuspended = false;
 		bool _spawnExec = false; // x86Sim: see setSpawnExec
-		bool _pendingReplacement = false;
+		// x86Sim: execs of a Darling image announced by a checkout and not yet ended by the new image's main-thread check-in
+		// or a failure report (see noteExecCheckout)
+		unsigned int _execsInFlight = 0;
 		std::unordered_map<uintptr_t, std::shared_ptr<Kqchan>> _kqchannels;
 		std::unordered_map<uintptr_t, std::weak_ptr<Kqchan::Process>> _listeningKqchannels;
 		dtape_semaphore_t* _dtapeForkWaitSemaphore;
@@ -183,10 +185,14 @@ namespace DarlingServer {
 
 		/**
 		 * Handles a check-in from this process's image. `isFork` is set by a new child after fork();
-		 * only that check-in ends its parent's wait in fork().
+		 * only that check-in ends its parent's wait in fork(). `fromMainThread`: the checking-in thread is the process's
+		 * main thread; only such a check-in can be the one an exec'd image makes.
 		 */
-		void notifyCheckin(Architecture architecture, bool isFork);
-		void setPendingReplacement();
+		void notifyCheckin(Architecture architecture, bool isFork, bool fromMainThread);
+		// x86Sim: an execve of a Darling image is about to happen (its checkout, before the reply that lets it go ahead)
+		void noteExecCheckout();
+		// x86Sim: an execve announced by noteExecCheckout() failed (its exec pipe got the failure byte)
+		void noteExecFailed();
 
 		void registerKqchan(std::shared_ptr<Kqchan> kqchan);
 		void unregisterKqchan(std::shared_ptr<Kqchan> kqchan);

@@ -330,10 +330,17 @@ bool DarlingServer::Process::writeMemory(uintptr_t remoteAddress, const void* lo
 	return _readOrWriteMemory(true, remoteAddress, const_cast<void*>(localBuffer), length, errorCode);
 };
 
-void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isFork) {
+void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isFork, bool fromMainThread) {
 	std::unique_lock lock(_rwlock);
 
-	bool didExec = _pendingReplacement;
+	// x86Sim: an exec'd image checks in on its main thread before it makes any other thread, so that check-in, and only
+	// that one, completes an exec announced at its checkout. Before, the exec pipe's hangup set a flag that the next
+	// check-in took as the exec; when the new image's main-thread check-in was handled before that hangup (the epoll
+	// thread drains every queued message first, and takes at most 16 events per wait), the flag outlived it and the
+	// image's first new thread's check-in ran this exec branch: it declared every other thread dead, the caller too,
+	// whose reply Thread::pushCallReply then dropped. That thread waited for ever in its check-in and its creator spun
+	// in mldr's __darling_thread_create (seen: SurfBoard's boot wedge on cov-vision, 2026-11-14).
+	bool didExec = !isFork && fromMainThread && _execsInFlight > 0;
 
 	if (didExec) {
 		// exec case
@@ -426,10 +433,15 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isFor
 		}
 	}
 
-	_pendingReplacement = false;
-
-	bool spawnExec = _spawnExec; // x86Sim
-	_spawnExec = false;
+	bool spawnExec = false; // x86Sim
+	if (didExec || isFork) {
+		// a fork child's check-in comes before its posix_spawn sets the flag; the exec's ends it
+		spawnExec = _spawnExec;
+		_spawnExec = false;
+	}
+	if (didExec) {
+		_execsInFlight = 0;
+	}
 
 	lock.unlock();
 
@@ -457,12 +469,21 @@ void DarlingServer::Process::notifyCheckin(Architecture architecture, bool isFor
 	}
 };
 
-void DarlingServer::Process::setPendingReplacement() {
+void DarlingServer::Process::noteExecCheckout() {
 	std::unique_lock lock(_rwlock);
 
 	processLog.info() << "Process " << id() << " (" << nsid() << ") is now pending replacement" << processLog.endLog;
 
-	_pendingReplacement = true;
+	++_execsInFlight;
+};
+
+void DarlingServer::Process::noteExecFailed() {
+	std::unique_lock lock(_rwlock);
+
+	// the new image may have checked in already (then it was a later exec that succeeded, and the count is 0)
+	if (_execsInFlight > 0) {
+		--_execsInFlight;
+	}
 };
 
 void DarlingServer::Process::registerKqchan(std::shared_ptr<Kqchan> kqchan) {

@@ -124,7 +124,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		});
 
 		if (!process) {
-			callLog.error() << "Received call from non-existent process?" << callLog.endLog;
+			callLog.error() << "Received call #" << header->number << " (" << dserver_callnum_to_string(header->number) << ") from non-existent process? PID " << header->pid << " (" << requestMessage.pid() << "), TID " << header->tid << "; dropped, the caller gets no reply" << callLog.endLog;
 
 			// ignore this call
 			// TODO: instead of ignoring it, we should return a generic reply indicating `-ESRCH` or something like that.
@@ -153,7 +153,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		});
 
 		if (!thread) {
-			callLog.error() << "Received call from non-existent thread?" << callLog.endLog;
+			callLog.error() << "Received call #" << header->number << " (" << dserver_callnum_to_string(header->number) << ") from non-existent thread? PID " << header->pid << " (" << requestMessage.pid() << "), TID " << header->tid << "; dropped, the caller gets no reply" << callLog.endLog;
 
 			// ignore this call
 			// TODO: instead of ignoring it, we should return a generic reply indicating `-ESRCH` or something like that.

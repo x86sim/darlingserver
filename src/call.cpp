@@ -36,8 +36,9 @@ DarlingServer::Log DarlingServer::Call::rpcReplyLog("replies");
 
 
 // x86Sim (Speed 36): opt-in RPC counters for the mach_msg fast-path study. On while the file
-// /home/bobby/scratch/x86sim/ds-rpcstats.on exists (checked once a second); every second with traffic, one line of
-// per-call-number counts and mach_msg shapes is appended to /home/bobby/scratch/x86sim/ds-rpcstats.log.
+// $X86SIM_SCRATCH/ds-rpcstats.on exists (checked once a second); every second with traffic, one line of
+// per-call-number counts and mach_msg shapes is appended to $X86SIM_SCRATCH/ds-rpcstats.log. Slots 400-449 count
+// memory-entry work (duct-tape memory.c, X86SIM_MSTAT), 450-459 S2C calls (thread.cpp).
 #include <atomic>
 #include <ctime>
 #include <unistd.h>
@@ -55,15 +56,26 @@ extern "C" void x86sim_rpcstat_msg(unsigned int bits, int rcv) {
 extern "C" void x86sim_rpcstat_slot(unsigned slot) {
 	if (x86sim_rpcstats_on && slot < 512) x86sim_calls[slot]++;
 }
+extern "C" void x86sim_rpcstat_add(unsigned slot, unsigned long n) {
+	if (x86sim_rpcstats_on && slot < 512) x86sim_calls[slot] += n;
+}
 static void x86sim_rpcstats_tick(unsigned number) {
 	static std::atomic<int64_t> last{0};
 	timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
 	int64_t sec = ts.tv_sec, l = last.load();
 	if (sec != l && last.compare_exchange_strong(l, sec)) {
 		bool was = x86sim_rpcstats_on;
-		x86sim_rpcstats_on = access("/home/bobby/scratch/x86sim/ds-rpcstats.on", F_OK) == 0;
+		// x86Sim: under $X86SIM_SCRATCH (was a fixed /home/bobby path)
+		static std::string onPath, logPath;
+		if (onPath.empty()) {
+			const char* d = getenv("X86SIM_SCRATCH");
+			std::string dir = d && *d ? d : "/tmp";
+			onPath = dir + "/ds-rpcstats.on";
+			logPath = dir + "/ds-rpcstats.log";
+		}
+		x86sim_rpcstats_on = access(onPath.c_str(), F_OK) == 0;
 		if (was) {
-			FILE* f = fopen("/home/bobby/scratch/x86sim/ds-rpcstats.log", "a");
+			FILE* f = fopen(logPath.c_str(), "a");
 			if (f) {
 				fprintf(f, "t=%lld calls", (long long)sec);
 				for (int i = 0; i < 512; i++) { uint64_t c = x86sim_calls[i].exchange(0); if (c) fprintf(f, " %d:%llu", i, (unsigned long long)c); }
@@ -535,8 +547,23 @@ void DarlingServer::Call::X86SimMemfdForRegion::processCall() {
 	int fd = -1;
 	uint64_t offset = 0;
 	uint32_t shared = 0;
+	if (_body.address == 0 && _body.size == 0) {
+		// x86Sim: capability probe (an older darlingserver fails it with -EFAULT): `offset` = the calls this one has
+		// past x86sim_memfd_for_region, bit 0 = x86sim_entry_copy_fd. A client must never send a call number its
+		// server doesn't know: the server drops it and the caller waits for its reply forever.
+		_sendReply(0, -1, 1, 0);
+		return;
+	}
 	int code = dtape_memfd_for_region(_body.address, _body.size, &fd, &offset, &shared);
 	_sendReply(code, fd, offset, shared); // the reply message closes our copy once sent
+};
+
+// x86Sim: see dtape_entry_copy_fd
+void DarlingServer::Call::X86SimEntryCopyFd::processCall() {
+	int fd = -1;
+	uint64_t fileOffset = 0, mapSize = 0, dataAdjust = 0;
+	int code = dtape_entry_copy_fd(_body.entry, _body.offset, _body.size, _body.flags, &fd, &fileOffset, &mapSize, &dataAdjust);
+	_sendReply(code, fd, fileOffset, mapSize, dataAdjust); // the reply message closes our copy once sent
 };
 
 void DarlingServer::Call::HostSelfTrap::processCall() {

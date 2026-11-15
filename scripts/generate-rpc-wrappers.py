@@ -723,6 +723,23 @@ calls = [
 		('offset', 'uint64_t'),
 		('shared', 'uint32_t'),
 	]),
+
+	# x86Sim: a copy=TRUE mach_vm_map of a memory entry into the caller itself, done by the caller: the server only
+	# hands back the entry's memfd, the byte offset and size of the pages to copy, and the data address adjustment
+	# (VM_FLAGS_RETURN_DATA_ADDR). The client allocates and preads them itself: no S2C mmap and no remote page faults
+	# (libxpc maps every out-of-line xpc_data > 16 KB this way, ~1800/s on an idle visionOS device). A nonzero code
+	# (e.g. -EAGAIN for an entry this doesn't handle) = use the vm_map MIG routine.
+	('x86sim_entry_copy_fd', [
+		('entry', 'uint32_t'),
+		('offset', 'uint64_t'),
+		('size', 'uint64_t'),
+		('flags', 'int32_t'),
+	], [
+		('fd', '@fd'),
+		('file_offset', 'uint64_t'),
+		('map_size', 'uint64_t'),
+		('data_adjust', 'uint64_t'),
+	]),
 ]
 
 ALLOWED_PRIVATE_TYPES = [

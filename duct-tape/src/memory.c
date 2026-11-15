@@ -8,6 +8,9 @@
 #include <kern/zalloc.h>
 #include <kern/kalloc.h>
 #include <vm/vm_kern.h>
+#include <ipc/ipc_object.h> // x86Sim: dtape_entry_copy_fd
+#include <ipc/ipc_space.h>
+#include <kern/task.h>
 
 #include <stdlib.h>
 
@@ -737,6 +740,10 @@ kern_return_t mach_vm_allocate_kernel(vm_map_t map, mach_vm_offset_t* addr, mach
  * mach_vm_map_external maps the memfd into the target task.
  */
 #define DT_MAP_MEM_ONLY          0x010000
+// x86Sim: memory-entry counters for darlingserver's opt-in rpcstats (call.cpp; slots 400 + n)
+extern void x86sim_rpcstat_slot(unsigned slot);
+extern void x86sim_rpcstat_add(unsigned slot, unsigned long n);
+#define X86SIM_MSTAT(n) x86sim_rpcstat_slot(400 + (n))
 #define DT_MAP_MEM_NAMED_CREATE  0x020000
 #define DT_MAP_MEM_USE_DATA_ADDR 0x100000
 
@@ -754,6 +761,7 @@ static bool dtape_region_matches_descriptor(vm_map_t map, uintptr_t start, size_
 		return false;
 	}
 	bool same = true;
+	X86SIM_MSTAT(13);
 	for (size_t done = 0; done < size && same; done += chunk) {
 		size_t n = size - done < chunk ? size - done : chunk;
 		if (copyinmap(map, start + done, buf, n) != KERN_SUCCESS || memcmp(buf, src + lead + done, n) != 0) {
@@ -793,7 +801,15 @@ static kern_return_t dtape_named_entry_create(dtape_map_shared_descriptor_t* des
 	return KERN_SUCCESS;
 };
 
+static kern_return_t x86sim_make_memory_entry(vm_map_t target_map, memory_object_size_t* size, memory_object_offset_t offset, vm_prot_t permission, ipc_port_t* object_handle, ipc_port_t parent_entry);
+static uint64_t x86sim_mstat_us(void);
 kern_return_t _mach_make_memory_entry(vm_map_t target_map, memory_object_size_t* size, memory_object_offset_t offset, vm_prot_t permission, ipc_port_t* object_handle, ipc_port_t parent_entry) {
+	uint64_t t0 = x86sim_mstat_us();
+	kern_return_t kr = x86sim_make_memory_entry(target_map, size, offset, permission, object_handle, parent_entry);
+	x86sim_rpcstat_add(420, x86sim_mstat_us() - t0);
+	return kr;
+};
+static kern_return_t x86sim_make_memory_entry(vm_map_t target_map, memory_object_size_t* size, memory_object_offset_t offset, vm_prot_t permission, ipc_port_t* object_handle, ipc_port_t parent_entry) {
 	vm_prot_t prot = permission & VM_PROT_ALL;
 	dtape_map_shared_descriptor_t* descriptor = NULL;
 	uint64_t entry_offset = 0, data_offset = 0, entry_size;
@@ -805,6 +821,7 @@ kern_return_t _mach_make_memory_entry(vm_map_t target_map, memory_object_size_t*
 		return parent ? KERN_SUCCESS : KERN_INVALID_ARGUMENT;
 	}
 
+	X86SIM_MSTAT(parent ? 2 : (permission & DT_MAP_MEM_NAMED_CREATE) ? 1 : 0);
 	if (parent) {
 		// x86Sim (Align 1): as XNU's mach_make_memory_entry_from_parent_entry (osfmk/vm/vm_memory_entry.c): with
 		// MAP_MEM_USE_DATA_ADDR the offset is relative to the parent's data address, i.e. parent->data_offset is added
@@ -999,6 +1016,7 @@ static kern_return_t dtape_share_region(vm_map_t map, uintptr_t start, size_t si
 				dtape_map_insert_shared_entry_locked(map, entry);
 			}
 			dtape_mutex_unlock(&map->shared_entry_lock);
+			X86SIM_MSTAT(3);
 			*out_descriptor = found;
 			*out_byte_offset = byte_offset;
 			return KERN_SUCCESS;
@@ -1045,6 +1063,7 @@ static kern_return_t dtape_share_region(vm_map_t map, uintptr_t start, size_t si
 		*out_descriptor = existing[0]->descriptor;
 		*out_byte_offset = (existing[0]->page_offset << map->dtape_page_shift) + (start - existing[0]->address);
 		dtape_mutex_unlock(&map->shared_entry_lock);
+		X86SIM_MSTAT(4);
 		return KERN_SUCCESS;
 	}
 	if (count != 0) {
@@ -1089,6 +1108,8 @@ static kern_return_t dtape_share_region(vm_map_t map, uintptr_t start, size_t si
 	// same race as in mach_vm_remap_external_shared: writes between the copy and the remap are lost
 	kern_return_t kr = copyinmap(map, start, mapped, size);
 	munmap(mapped, size);
+	X86SIM_MSTAT(snapshot ? 6 : 5);
+	x86sim_rpcstat_add(411, size >> 10);
 	if (kr == KERN_SUCCESS && snapshot) {
 		*out_descriptor = descriptor;
 		*out_byte_offset = 0;
@@ -1217,7 +1238,59 @@ static int x86sim_frozen_snapshot(int memfd, uint64_t offset, uint64_t size) {
 	return result;
 };
 
+extern int x86sim_rpcstats_on;
+static uint64_t x86sim_mstat_us(void) {
+	if (!x86sim_rpcstats_on) {
+		return 0;
+	}
+	struct timespec ts;
+	clock_gettime(1 /* CLOCK_MONOTONIC */, &ts);
+	return ts.tv_sec * 1000000ull + ts.tv_nsec / 1000;
+};
+static kern_return_t x86sim_vm_map_external(vm_map_t target_map, mach_vm_offset_t* address, mach_vm_size_t initial_size, mach_vm_offset_t mask, int flags, ipc_port_t port, vm_object_offset_t offset, boolean_t copy, vm_prot_t cur_protection, vm_prot_t max_protection, vm_inherit_t inheritance);
+
+// x86Sim: a copy=TRUE mach_vm_map of the memory entry `entry_name` into the calling task, done by the caller itself
+// (libsystem_kernel's mach_vm_map; RPC x86sim_entry_copy_fd): returns a dup of the entry's memfd, the byte offset and
+// size of the pages the mapping covers and what VM_FLAGS_RETURN_DATA_ADDR adds to the address, exactly as
+// mach_vm_map_external's copy path below computes them. The caller allocates private memory and preads the pages:
+// the same snapshot of the current contents, but without the S2C mmap into the caller and the copy's page faults
+// taken from here. -EAGAIN for anything else (frozen snapshots, not a memfd entry): the caller uses the MIG routine.
+int dtape_entry_copy_fd(uint32_t entry_name, uint64_t offset, uint64_t size, int32_t flags, int* out_fd, uint64_t* out_file_offset, uint64_t* out_map_size, uint64_t* out_data_adjust) {
+	ipc_port_t port = IP_NULL;
+	if (size == 0 || ipc_object_copyin(current_task()->itk_space, entry_name, MACH_MSG_TYPE_COPY_SEND, (ipc_object_t*)&port, 0, NULL, IPC_OBJECT_COPYIN_FLAGS_ALLOW_IMMOVABLE_SEND) != KERN_SUCCESS) {
+		return -11; // EAGAIN
+	}
+	int result = -11;
+	vm_named_entry_t entry = dtape_named_entry_for_port(port);
+	if (entry) {
+		uint64_t data_offset = offset + ((flags & VM_FLAGS_RETURN_DATA_ADDR) ? entry->data_offset : 0);
+		uint64_t page_offset = mach_vm_trunc_page(data_offset);
+		uint64_t map_size = mach_vm_round_page(data_offset - page_offset + size);
+		if (page_offset + map_size > entry->size && page_offset < entry->size) {
+			map_size = mach_vm_round_page(entry->size - page_offset);
+		}
+		if (page_offset + map_size <= entry->size && !(map_size >= 0x40000 && x86sim_frozen_enabled())) {
+			int fd = dup(((dtape_map_shared_descriptor_t*)entry->dtape_descriptor)->memfd);
+			if (fd >= 0) {
+				*out_fd = fd;
+				*out_file_offset = entry->offset + page_offset;
+				*out_map_size = map_size;
+				*out_data_adjust = (flags & VM_FLAGS_RETURN_DATA_ADDR) ? data_offset - page_offset : 0;
+				X86SIM_MSTAT(14);
+				result = 0;
+			}
+		}
+	}
+	ipc_port_release_send(port);
+	return result;
+};
 kern_return_t mach_vm_map_external(vm_map_t target_map, mach_vm_offset_t* address, mach_vm_size_t initial_size, mach_vm_offset_t mask, int flags, ipc_port_t port, vm_object_offset_t offset, boolean_t copy, vm_prot_t cur_protection, vm_prot_t max_protection, vm_inherit_t inheritance) {
+	uint64_t t0 = x86sim_mstat_us();
+	kern_return_t kr = x86sim_vm_map_external(target_map, address, initial_size, mask, flags, port, offset, copy, cur_protection, max_protection, inheritance);
+	if (IP_VALID(port)) x86sim_rpcstat_add(421, x86sim_mstat_us() - t0);
+	return kr;
+};
+static kern_return_t x86sim_vm_map_external(vm_map_t target_map, mach_vm_offset_t* address, mach_vm_size_t initial_size, mach_vm_offset_t mask, int flags, ipc_port_t port, vm_object_offset_t offset, boolean_t copy, vm_prot_t cur_protection, vm_prot_t max_protection, vm_inherit_t inheritance) {
 	// x86Sim: was a stub that returned success without mapping anything
 	int prot = 0;
 	dtape_memory_flags_t memflags = 0;
@@ -1263,6 +1336,7 @@ kern_return_t mach_vm_map_external(vm_map_t target_map, mach_vm_offset_t* addres
 	}
 
 	int frozen_fd = (copy && size >= 0x40000) ? x86sim_frozen_snapshot(descriptor->memfd, file_offset, size) : -1;
+	X86SIM_MSTAT(frozen_fd >= 0 ? 7 : copy ? 8 : 9);
 	if (frozen_fd >= 0) {
 		addr = dtape_hooks->task_map_file(target_map->dtape_task->context, frozen_fd, dtape_byte_count_to_page_count_round_up(size), prot, hint, 0, memflags | dtape_memory_flag_private);
 		close(frozen_fd);
@@ -1275,12 +1349,19 @@ kern_return_t mach_vm_map_external(vm_map_t target_map, mach_vm_offset_t* addres
 		if (!addr) {
 			return KERN_NO_SPACE;
 		}
+		uint64_t xt0 = x86sim_mstat_us();
 		void* src = mmap(NULL, size, PROT_READ, MAP_SHARED, descriptor->memfd, file_offset);
 		if (src == MAP_FAILED) {
 			return KERN_FAILURE;
 		}
+		uint64_t xt1 = x86sim_mstat_us();
 		kern_return_t kr = copyoutmap(target_map, src, addr, size);
+		uint64_t xt2 = x86sim_mstat_us();
 		munmap(src, size);
+		uint64_t xt3 = x86sim_mstat_us();
+		x86sim_rpcstat_add(422, xt2 - xt1);
+		x86sim_rpcstat_add(423, (xt1 - xt0) + (xt3 - xt2));
+		x86sim_rpcstat_add(412, size >> 10);
 		if (kr != KERN_SUCCESS) {
 			return kr;
 		}
@@ -2250,6 +2331,7 @@ mach_destroy_memory_entry(
 	named_entry->ref_count -= 1;
 
 	if (named_entry->ref_count == 0) {
+		X86SIM_MSTAT(10);
 		if (named_entry->dtape_descriptor) {
 			// x86Sim: memfd-backed entry
 			dtape_map_shared_descriptor_release(named_entry->dtape_descriptor);

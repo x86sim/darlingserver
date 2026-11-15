@@ -1278,7 +1278,12 @@ std::optional<DarlingServer::Message> DarlingServer::Thread::_s2cPerform(Message
 	return std::move(*reply);
 };
 
+extern "C" void x86sim_rpcstat_slot(unsigned slot);
+extern "C" void x86sim_rpcstat_add(unsigned slot, unsigned long n);
+extern "C" int x86sim_rpcstats_on;
+
 uintptr_t DarlingServer::Thread::_mmap(uintptr_t address, size_t length, int protection, int flags, int fd, off_t offset, int& outErrno) {
+	x86sim_rpcstat_slot(450); // x86Sim: S2C counters (call.cpp rpcstats)
 	// XXX: not sure if we want to force all allocations in 32-bit processes to be in the 32-bit address space.
 	//      for now, we leave it up to the caller.
 #if 0
@@ -1316,7 +1321,13 @@ uintptr_t DarlingServer::Thread::_mmap(uintptr_t address, size_t length, int pro
 
 	s2cLog.debug() << "Performing _mmap with address=" << call->address << ", length=" << call->length << ", protection=" << call->protection << ", flags=" << call->flags << ", fd=" << call->fd << " (" << fd << ")" << ", offset=" << call->offset << s2cLog.endLog;
 
+	timespec x86simT0{}, x86simT1{};
+	if (x86sim_rpcstats_on) clock_gettime(CLOCK_MONOTONIC, &x86simT0);
 	auto maybeReplyMessage = _s2cPerform(std::move(callMessage), dserver_s2c_msgnum_mmap, sizeof(dserver_s2c_reply_mmap_t));
+	if (x86sim_rpcstats_on) {
+		clock_gettime(CLOCK_MONOTONIC, &x86simT1);
+		x86sim_rpcstat_add(455, (x86simT1.tv_sec - x86simT0.tv_sec) * 1000000 + (x86simT1.tv_nsec - x86simT0.tv_nsec) / 1000); // us in S2C mmap
+	}
 	if (!maybeReplyMessage) {
 		s2cLog.debug() << "_mmap call interrupted" << s2cLog.endLog;
 		outErrno = EINTR;
@@ -1333,6 +1344,7 @@ uintptr_t DarlingServer::Thread::_mmap(uintptr_t address, size_t length, int pro
 };
 
 int DarlingServer::Thread::_munmap(uintptr_t address, size_t length, int& outErrno) {
+	x86sim_rpcstat_slot(451); // x86Sim: S2C counters (call.cpp rpcstats)
 	Message callMessage(sizeof(dserver_s2c_call_munmap_t), 0);
 	auto call = reinterpret_cast<dserver_s2c_call_munmap_t*>(callMessage.data().data());
 
@@ -1360,6 +1372,7 @@ int DarlingServer::Thread::_munmap(uintptr_t address, size_t length, int& outErr
 };
 
 int DarlingServer::Thread::_mprotect(uintptr_t address, size_t length, int protection, int& outErrno) {
+	x86sim_rpcstat_slot(452); // x86Sim: S2C counters (call.cpp rpcstats)
 	Message callMessage(sizeof(dserver_s2c_call_mprotect_t), 0);
 	auto call = reinterpret_cast<dserver_s2c_call_mprotect_t*>(callMessage.data().data());
 
@@ -1388,6 +1401,7 @@ int DarlingServer::Thread::_mprotect(uintptr_t address, size_t length, int prote
 };
 
 int DarlingServer::Thread::_msync(uintptr_t address, size_t size, int sync_flags, int& outErrno) {
+	x86sim_rpcstat_slot(453); // x86Sim: S2C counters (call.cpp rpcstats)
 	Message callMessage(sizeof(dserver_s2c_call_msync_t), 0);
 	auto call = reinterpret_cast<dserver_s2c_call_msync_t*>(callMessage.data().data());
 

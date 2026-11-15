@@ -30,6 +30,7 @@ int dtape_fileport_makeport(int fd, uint32_t* out_name);
 int dtape_fileport_makefd(uint32_t name, int* out_fd);
 // x86Sim: the memfd behind [address, address + size) of the current task (see memory.c)
 int dtape_memfd_for_region(uint64_t address, uint64_t size, int* out_fd, uint64_t* out_offset, uint32_t* out_shared);
+int dtape_entry_copy_fd(uint32_t entry_name, uint64_t offset, uint64_t size, int32_t flags, int* out_fd, uint64_t* out_file_offset, uint64_t* out_map_size, uint64_t* out_data_adjust);
 uint32_t dtape_thread_get_special_reply_port(void);
 uint32_t dtape_mk_timer_create(void);
 

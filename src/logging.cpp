@@ -22,6 +22,8 @@
 #include <darlingserver/thread.hpp>
 #include <darlingserver/process.hpp>
 #include <filesystem>
+#include <cstring>
+#include <cstdlib>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -45,12 +47,9 @@ DarlingServer::Log::Log(std::string category):
 
 DarlingServer::Log::Stream::Stream(Type type, const Log& log):
 	_type(type),
-	_log(log)
-{
-	if (log._wants(type)) {
-		_buffer.emplace();
-	}
-};
+	_log(log),
+	_buffer(log.enabled(type) ? std::make_unique<std::ostringstream>() : nullptr)
+	{};
 
 DarlingServer::Log::Stream::~Stream() {
 	*this << endLog;
@@ -70,10 +69,9 @@ DarlingServer::Log::Stream& DarlingServer::Log::Stream::operator<<(EndLog value)
 };
 
 DarlingServer::Log::Stream& DarlingServer::Log::Stream::operator<<(const Loggable& loggable) {
-	if (!_buffer) {
-		return *this;
+	if (_buffer) {
+		loggable.logToStream(*this);
 	}
-	loggable.logToStream(*this);
 	return *this;
 };
 
@@ -108,7 +106,7 @@ std::string DarlingServer::Log::_typeToString(Type type) {
 	}
 };
 
-// x86Sim: the level/category filter of _log, also asked when a Stream is made
+// x86Sim: the log file, opened once; also asked by enabled()
 static int dserverLogFile() {
 	static int logFile = []() {
 		std::filesystem::path path(DarlingServer::Server::sharedInstance().prefix() + "/private/var/log/dserver.log");
@@ -119,7 +117,7 @@ static int dserverLogFile() {
 	return logFile;
 }
 
-bool DarlingServer::Log::_wants(Type type) const {
+bool DarlingServer::Log::enabled(Type type) const {
 	static Type logMinLevel = []() {
 		auto val = getenv("DSERVER_LOG_LEVEL");
 		Type level = DEFAULT_LOG_CUTOFF;
@@ -137,7 +135,7 @@ bool DarlingServer::Log::_wants(Type type) const {
 		return level;
 	}();
 
-	// DSERVER_LOG_CATEGORIES: comma-separated categories logged at every level, whatever DSERVER_LOG_LEVEL says
+	// x86Sim: DSERVER_LOG_CATEGORIES: comma-separated categories logged at every level, whatever DSERVER_LOG_LEVEL says
 	static std::string debugCategories = []() {
 		auto val = getenv("DSERVER_LOG_CATEGORIES");
 		return val ? std::string(",") + val + "," : std::string();
@@ -157,7 +155,7 @@ void DarlingServer::Log::_log(Type type, std::string message) const {
 		return val && strlen(val) >= 1 && (val[0] == 't' || val[0] == 'T' || val[0] == '1');
 	}();
 
-	if (!_wants(type)) {
+	if (!enabled(type)) {
 		return;
 	}
 

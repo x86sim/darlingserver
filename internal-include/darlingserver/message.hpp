@@ -28,6 +28,7 @@
 #include <mutex>
 #include <optional>
 #include <functional>
+#include <array>
 
 namespace DarlingServer {
 	class Address {
@@ -84,6 +85,16 @@ namespace DarlingServer {
 		 */
 		Message(size_t bufferSpace = 256, size_t descriptorSpace = 4, std::function<void()> sendNotificationCallback = nullptr);
 		~Message();
+
+		/**
+		 * Caches this process's PID, UID and GID for the credentials attached to every Message,
+		 * instead of querying them for each one.
+		 *
+		 * Call this once, before any other thread is started and after the final change of
+		 * the process's IDs. Without it, every Message queries them itself. A forked child
+		 * discards the cache.
+		 */
+		static void initializeServerCredentials();
 
 		Message(Message&&);
 		Message& operator=(Message&&);
@@ -169,6 +180,7 @@ namespace DarlingServer {
 		// its message is taken
 		std::vector<Message> _receiveSlots;
 		size_t _receiveWidth;
+		void _notifyIfNotEmpty();
 
 	public:
 		/**
@@ -187,6 +199,17 @@ namespace DarlingServer {
 		 * on EAGAIN the message stays queued and the arrival callback runs, as for push().
 		 */
 		void pushOrSend(Message&& message, int socket);
+
+		/**
+		 * Queues the message and sends as much of the queue as the socket takes right away, on the calling thread.
+		 *
+		 * Sending always starts at the head of the queue (as in sendMany()), so the message never overtakes messages
+		 * queued before it. The message-arrival notification callback is only called when messages are left in the queue,
+		 * i.e. when the socket could not take them all or sending failed; whoever handles it retries with sendMany().
+		 * Errors are thrown as in sendMany(), after that notification; the messages stay queued.
+		 */
+		void pushAndSend(Message&& message, int socket);
+
 		std::optional<Message> pop();
 
 		bool sendMany(int socket);

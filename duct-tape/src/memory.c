@@ -13,6 +13,7 @@
 #include <kern/task.h>
 
 #include <stdlib.h>
+#include <sys/errno.h>
 
 #include <mach_debug/mach_debug.h>
 
@@ -32,7 +33,21 @@ struct kalloc_heap KHEAP_TEMP[1];
 vm_size_t kalloc_max_prerounded = 0;
 
 void* calloc(size_t count, size_t size);
+#if defined(__ANDROID__)
+static inline void* darling_aligned_alloc(size_t alignment, size_t size) {
+	void* ptr = NULL;
+	if (alignment < sizeof(void*)) {
+		alignment = sizeof(void*);
+	}
+	if (posix_memalign(&ptr, alignment, size) != 0) {
+		return NULL;
+	}
+	return ptr;
+}
+#define aligned_alloc darling_aligned_alloc
+#else
 void* aligned_alloc(size_t alignment, size_t size);
+#endif
 
 void* mmap(void* addr, size_t length, int prot, int flags, int fd, long int offset);
 int munmap(void* addr, size_t length);
@@ -529,12 +544,12 @@ kern_return_t copyinmap(vm_map_t map, vm_map_offset_t fromaddr, void* todata, vm
 };
 
 int (copyin)(const user_addr_t user_addr, void* kernel_addr, vm_size_t nbytes) {
-	return (copyinmap(current_map(), user_addr, kernel_addr, nbytes) == KERN_SUCCESS) ? 0 : 1;
+	return (copyinmap(current_map(), user_addr, kernel_addr, nbytes) == KERN_SUCCESS) ? 0 : EFAULT;
 };
 
 int (copyout)(const void* kernel_addr, user_addr_t user_addr, vm_size_t nbytes) {
 	// it doesn't actually modify kernel_addr
-	return (copyoutmap(current_map(), (void*)kernel_addr, user_addr, nbytes) == KERN_SUCCESS) ? 0 : 1;
+	return (copyoutmap(current_map(), (void*)kernel_addr, user_addr, nbytes) == KERN_SUCCESS) ? 0 : EFAULT;
 };
 
 int copyinmsg(const user_addr_t user_addr, char* kernel_addr, mach_msg_size_t nbytes) {

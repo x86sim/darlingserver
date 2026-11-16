@@ -148,6 +148,7 @@ calls = [
 	('set_thread_handles', [
 		('pthread_handle', 'uint64_t'),
 		('dispatch_qaddr', 'uint64_t'),
+		('cancel_marked_addr', 'uint64_t'),
 	], []),
 
 	('vchroot', [
@@ -235,6 +236,22 @@ calls = [
 		('buffer_size', 'uint64_t')
 	], []),
 
+	('file_ref_register', [
+		('device', 'uint64_t'),
+		('inode', 'uint64_t'),
+		('path', 'const char*', 'uint64_t'),
+		('path_length', 'uint64_t'),
+	], []),
+
+	('file_ref_path', [
+		('device', 'uint64_t'),
+		('inode', 'uint64_t'),
+		('buffer', 'char*', 'uint64_t'),
+		('buffer_size', 'uint64_t'),
+	], [
+		('length', 'uint64_t'),
+	]),
+
 	('get_executable_path', [
 		('pid', 'int32_t'),
 		('buffer', 'char*', 'uint64_t'),
@@ -285,6 +302,8 @@ calls = [
 		('action', 'int32_t'),
 	], []),
 
+	('pthread_testcancel', [], []),
+
 	('pthread_markcancel', [
 		('thread_port', 'uint32_t'),
 	], []),
@@ -295,19 +314,6 @@ calls = [
 
 	('task_self_trap', [], [
 		('port_name', 'uint32_t'),
-	]),
-
-	# x86Sim: fileports
-	('fileport_makeport', [
-		('fd', '@fd'),
-	], [
-		('port_name', 'uint32_t'),
-	]),
-
-	('fileport_makefd', [
-		('port_name', 'uint32_t'),
-	], [
-		('fd', '@fd'),
 	]),
 
 	('host_self_trap', [], [
@@ -465,6 +471,18 @@ calls = [
 		('pid', 'int32_t'),
 		('t', 'uint32_t*', 'uint64_t'),
 	], [], XNU_TRAP_CALL | XNU_TRAP_NOPREFIX | XNU_TRAP_NOSUFFIX),
+
+	('task_read_for_pid', [
+		('target_tport', 'uint32_t'),
+		('pid', 'int32_t'),
+		('t', 'uint32_t*', 'uint64_t'),
+	], [], XNU_TRAP_CALL | XNU_TRAP_NOPREFIX | XNU_TRAP_NOSUFFIX | XNU_TRAP_NO_DTAPE_DEF),
+
+	('task_inspect_for_pid', [
+		('target_tport', 'uint32_t'),
+		('pid', 'int32_t'),
+		('t', 'uint32_t*', 'uint64_t'),
+	], [], XNU_TRAP_CALL | XNU_TRAP_NOPREFIX | XNU_TRAP_NOSUFFIX | XNU_TRAP_NO_DTAPE_DEF),
 
 	('pid_for_task', [
 		('t', 'uint32_t'),
@@ -710,6 +728,165 @@ calls = [
 		('fd', '@fd'),
 	], UNMANAGED_CALL),
 
+	#
+	# fileports
+	#
+
+	('fileport_makeport', [
+		('fd', '@fd'),
+	], [
+		('port_name', 'uint32_t'),
+	]),
+
+	('fileport_makefd', [
+		('port_name', 'uint32_t'),
+	], [
+		('fd', '@fd'),
+	]),
+
+	#
+	# system configuration
+	#
+	# `config` points to a `dserver_system_config_t` (see rpc-supplement.h)
+	# and `config_size` must be its size.
+	#
+
+	('set_system_config', [
+		('config', 'const void*', 'uint64_t'),
+		('config_size', 'uint64_t'),
+	], []),
+
+	('get_system_config', [
+		('config', 'void*', 'uint64_t'),
+		('config_size', 'uint64_t'),
+	], []),
+
+	('wait_system_config', [], [], ALLOW_INTERRUPTIONS),
+
+	#
+	# host process IDs
+	#
+	# Darling processes live in their own PID namespace. Protocols shared with
+	# host programs (e.g. EWMH's _NET_WM_PID) need the PID as the host sees it.
+	#
+
+	# the calling process's PID in the host's PID namespace
+	('host_pid', [], [
+		('host_pid', 'int32_t'),
+	]),
+
+	# the (namespaced) PID of the Darling process with the given host PID;
+	# fails with ESRCH for any other host process
+	('pid_for_host_pid', [
+		('host_pid', 'int32_t'),
+	], [
+		('pid', 'int32_t'),
+	]),
+
+	#
+	# platform identity
+	#
+	# `identity` points to a `dserver_platform_identity_t` (see rpc-supplement.h)
+	# and `identity_size` must be its size.
+	#
+
+	('set_platform_identity', [
+		('identity', 'const void*', 'uint64_t'),
+		('identity_size', 'uint64_t'),
+	], []),
+
+	('get_platform_identity', [
+		('identity', 'void*', 'uint64_t'),
+		('identity_size', 'uint64_t'),
+	], []),
+
+	#
+	# code signing
+	#
+	# See `dserver_cs_state_t` in rpc-supplement.h. `pid` 0 means the calling process.
+	#
+
+	# registers the image the calling process starts from (mldr calls this once per exec);
+	# darlingserver reads it itself. `image` may be -1 when it could not be opened.
+	# under the enforce policy, fails with EPERM when the process may not register (again).
+	('cs_register_image', [
+		('image', '@fd'),
+		('image_offset', 'uint64_t'),
+	], [
+		('flags', 'uint32_t'),
+	]),
+
+	# `state` points to a `dserver_cs_state_t` and `state_size` must be its size
+	('cs_get_state', [
+		('pid', 'int32_t'),
+		('state', 'void*', 'uint64_t'),
+		('state_size', 'uint64_t'),
+	], []),
+
+	# copies the (DER, if `der` is set) entitlements blob of a process, header included;
+	# `length` is its full length (0 if there is none). fails with ERANGE, after copying
+	# nothing, when the buffer is too small.
+	('cs_copy_entitlements', [
+		('pid', 'int32_t'),
+		('der', 'bool'),
+		('buffer', 'void*', 'uint64_t'),
+		('buffer_size', 'uint64_t'),
+	], [
+		('length', 'uint64_t'),
+	]),
+
+	# the `csops` operations that change flags; only some flags may be set, and fewer cleared.
+	# allowed for the process itself and for root; library validation (CS_REQUIRE_LV and
+	# CS_FORCED_LV) only for the process itself. returns the new flags.
+	('cs_update_flags', [
+		('pid', 'int32_t'),
+		('set_flags', 'uint32_t'),
+		('clear_flags', 'uint32_t'),
+	], [
+		('flags', 'uint32_t'),
+	]),
+
+	# records that the calling process called ptrace(PT_DENY_ATTACH)
+	('cs_deny_attach', [], []),
+
+	# verifies an image (a library dyld is about to map) without registering it; also says
+	# whether the calling process's library validation policy would accept it. `page_size_log2`
+	# is the CodeDirectory's hash page size (0 when there is none).
+	('cs_verify_image', [
+		('image', '@fd'),
+		('image_offset', 'uint64_t'),
+	], [
+		('status', 'uint32_t'),
+		('flags', 'uint32_t'),
+		('code_limit', 'uint64_t'),
+		('page_size_log2', 'uint32_t'),
+		('library_validation_ok', 'bool'),
+	]),
+
+	# records that the calling process applied a sandbox profile (`DSERVER_CS_SANDBOXED`);
+	# Darling enforces no sandbox, so this only changes what the process reports
+	('cs_mark_sandboxed', [], []),
+
+	# Append new calls to preserve existing wire call numbers. Let XNU
+	# validate the count and copy the result into the calling task.
+	('mach_generate_activity_id', [
+		('target', 'uint32_t'),
+		('count', 'int32_t'),
+		('activity_id', 'uint64_t*', 'uint64_t'),
+	], [], XNU_TRAP_CALL | XNU_TRAP_NOPREFIX | XNU_TRAP_NOSUFFIX),
+
+	# the LC_UUID of the main executable the process was started from (16 bytes, as
+	# `proc_pidinfo(PROC_PIDUNIQIDENTIFIERINFO)` reports it in `p_uuid`). `set` is called by the
+	# loader about the image it loads; `get` reads another process's value (ESRCH when no
+	# such process; all zeros when the image has no LC_UUID).
+	('set_executable_uuid', [
+		('uuid', 'const void*', 'uint64_t'),
+	], []),
+
+	('get_executable_uuid', [
+		('pid', 'int32_t'),
+		('uuid', 'void*', 'uint64_t'),
+	], []),
 	# x86Sim: appended last so that the numbers of all other calls stay the same (mldr, the darling launcher
 	# and other already-built clients keep working).
 	# The memfd behind a range of the caller's memory (made shared first if it isn't), for handing

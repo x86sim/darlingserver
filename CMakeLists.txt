@@ -68,10 +68,19 @@ else()
 	)
 endif()
 
+# Detect Bionic (Android/Termux) from the compiler, so that native builds on
+# an Android device are recognized even when CMAKE_SYSTEM_NAME is Linux.
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("
+#if !defined(__ANDROID__) && !defined(__BIONIC__)
+#error not Bionic
+#endif
+int main() { return 0; }
+" DSERVER_BIONIC)
+
 add_subdirectory(duct-tape)
 
 set(DARLINGSERVER_INIT_PROCESS "/sbin/launchd" CACHE STRING "The init process darlingserver should execute (default is \"/sbin/launchd\")")
-set(DARLINGSERVER_XDG_USER_DIR_CMD "xdg-user-dir" CACHE STRING "The xdg-user-dir binary darlingserver should execute (default is \"xdg-user-dir\")")
 
 include_directories(
 	include
@@ -119,6 +128,12 @@ add_executable(darlingserver
 	src/kqchan.cpp
 	src/async-writer.cpp
 	src/stack-pool.cpp
+	src/system-config.cpp
+	src/platform-identity.cpp
+	src/code-signing.cpp
+	src/trust-store.cpp
+	src/prefix-setup.cpp
+	src/run-mode.cpp
 )
 
 add_dependencies(darlingserver
@@ -126,9 +141,56 @@ add_dependencies(darlingserver
 	rtsig_h
 )
 
+find_package(OpenSSL 3 REQUIRED COMPONENTS Crypto)
+
+# Link the library file rather than OpenSSL::Crypto: the imported target adds
+# its include directory (usually /usr/include) as a system include, which
+# moves it ahead of the C++ standard library's headers and breaks their
+# #include_next. The headers are on the default search path anyway.
+if (NOT OPENSSL_INCLUDE_DIR STREQUAL "/usr/include")
+	target_include_directories(darlingserver PRIVATE ${OPENSSL_INCLUDE_DIR})
+endif()
+
 target_link_libraries(darlingserver PRIVATE
 	darlingserver_duct_tape
+	darlingserver_dc_codesign
+	${OPENSSL_CRYPTO_LIBRARY}
 )
+
+find_package(LibXml2 REQUIRED)
+
+# The code signature parser (include/darlingserver/dc_codesign.h and dc_entitlements.h).
+# Host code, shared with mldr, so it is built position-independent.
+add_library(darlingserver_dc_codesign STATIC
+	src/codesign/dc_codesign.c
+	src/codesign/dc_entitlements.c
+)
+set_target_properties(darlingserver_dc_codesign PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# <kern/cs_blobs.h> is copied into an include directory of its own, so that host code using it
+# does not also see the rest of the imported XNU headers (which clash with the host's)
+configure_file(duct-tape/xnu/osfmk/kern/cs_blobs.h ${CMAKE_CURRENT_BINARY_DIR}/codesign-include/kern/cs_blobs.h COPYONLY)
+target_include_directories(darlingserver_dc_codesign PUBLIC
+	include
+	${CMAKE_CURRENT_BINARY_DIR}/codesign-include
+)
+if (NOT OPENSSL_INCLUDE_DIR STREQUAL "/usr/include")
+	target_include_directories(darlingserver_dc_codesign PRIVATE ${OPENSSL_INCLUDE_DIR})
+endif()
+# Like OpenSSL above: LibXml2::LibXml2 can carry /usr/include (from pkg-config) as a
+# system include directory, which breaks libstdc++'s #include_next <stdlib.h>.
+target_include_directories(darlingserver_dc_codesign PUBLIC ${LIBXML2_INCLUDE_DIR})
+target_link_libraries(darlingserver_dc_codesign PUBLIC
+	${OPENSSL_CRYPTO_LIBRARY}
+	${LIBXML2_LIBRARY}
+)
+
+if (DSERVER_BIONIC)
+	# Bionic has no usable ucontext functions or POSIX semaphores of its own on
+	# these hosts; they come from libucontext and android-posix-semaphore.
+	find_library(LIBUCONTEXT ucontext REQUIRED)
+	find_library(LIBSEMAPHORE android-posix-semaphore REQUIRED)
+	target_link_libraries(darlingserver PRIVATE ${LIBUCONTEXT} ${LIBSEMAPHORE})
+endif()
 
 target_compile_options(darlingserver PRIVATE
 	-pthread
@@ -173,8 +235,4 @@ if (NOT "${DARLINGSERVER_INIT_PROCESS}" STREQUAL "")
 	)
 endif()
 
-if (NOT "${DARLINGSERVER_XDG_USER_DIR_CMD}" STREQUAL "")
-	target_compile_definitions(darlingserver PRIVATE
-		DARLINGSERVER_XDG_USER_DIR_CMD="${DARLINGSERVER_XDG_USER_DIR_CMD}"
-	)
-endif()
+add_subdirectory(tests)

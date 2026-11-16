@@ -1,5 +1,4 @@
-// Stand-in types for Call::callFromMessage (after VibeDarling/darlingserver tests/host/call_stubs.hpp, with the
-// members x86Sim's callFromMessage uses) (included by call_*_test.cpp before the extracted function).
+// Stand-in types for Call::callFromMessage (included by call_*_test.cpp before the extracted function).
 // Only the function body under test is real; Message, Process, Thread and the registries are stubs that
 // record what the function does to them.
 #pragma once
@@ -33,19 +32,20 @@ typedef struct { dserver_rpc_callhdr_t header; } dserver_rpc_call_dbg_t;
 typedef struct { dserver_rpc_callhdr_t header; uint64_t reply; uint64_t reply_size; } dserver_rpc_call_push_reply_t;
 
 static const char* dserver_callnum_to_string(uint32_t) { return "call"; }
-typedef struct dtape_semaphore dtape_semaphore_t;
-static void dtape_semaphore_up(dtape_semaphore_t*) {}
-static void dtape_semaphore_retain(dtape_semaphore_t*) {}
-static void dtape_semaphore_release(dtape_semaphore_t*) {}
-static void x86sim_rpcstats_tick(unsigned) {} // x86Sim: RPC counters (call.cpp)
+static void dtape_semaphore_up(void*) {}
 
 struct NullBuf : std::streambuf { int overflow(int c) override { return c; } };
 static NullBuf nullBuf;
 static std::ostream nullStream(&nullBuf);
+namespace DarlingServer {
+	struct Log {
+		enum class Type { Debug = 1, Info = 2, Warning = 3, Error = 4 };
+	};
+};
 struct LogStub {
+	bool enabled(DarlingServer::Log::Type) const { return true; }
 	std::ostream& debug() const { return nullStream; }
 	std::ostream& error() const { return nullStream; }
-	std::ostream& warning() const { return nullStream; }
 	static constexpr const char* endLog = "";
 };
 static LogStub callLog;
@@ -107,8 +107,7 @@ namespace DarlingServer {
 		std::shared_ptr<Process> _process; pid_t _nsid; Address address;
 		std::shared_mutex _rwlock;
 		std::optional<Message> _s2cReply, _pendingSavedReply;
-		dtape_semaphore_t* _s2cReplySempahore = nullptr;
-		int _s2cAbandonedReplies = 0;
+		void* _s2cReplySempahore = nullptr;
 		std::shared_ptr<Call> _pendingCall;
 		std::stack<Interrupt> _interrupts;
 		Thread(std::shared_ptr<Process> p, pid_t nsid, void*): _process(p), _nsid(nsid) {}
@@ -117,7 +116,7 @@ namespace DarlingServer {
 		pid_t nsid() const { return _nsid; }
 		void setAddress(Address a) { address = a; }
 		void registerWithProcess() {}
-		bool setPendingCall(std::shared_ptr<Call> c) { _pendingCall = c; return true; }
+		void setPendingCall(std::shared_ptr<Call> c) { _pendingCall = c; }
 		static void kernelAsync(std::function<void()>) {}
 	};
 	inline std::ostream& operator<<(std::ostream& o, const Thread&) { return o; }
@@ -144,7 +143,6 @@ namespace DarlingServer {
 	struct Call {
 		enum class Number { InterruptEnter, Other };
 		virtual ~Call() = default;
-		bool _madeByMldr = false;
 		Number number() const { return Number::Other; }
 		void processCall() {}
 		static std::shared_ptr<Call> callFromMessage(Message&& requestMessage);
@@ -152,9 +150,6 @@ namespace DarlingServer {
 	struct DbgCall : Call {
 		DbgCall(std::shared_ptr<Thread>, dserver_rpc_call_dbg_t*, Message&&) {}
 	};
-	// x86Sim: callFromMessage marks mldr's checkin / checkout (willi/darlingserver#14)
-	struct Checkin : Call { struct { bool is_fork = false; } _body; };
-	struct Checkout : Call { struct { int exec_listener_pipe = -1; } _body; };
 	struct DummyCall : Call {
 		DummyCall(std::shared_ptr<Thread>, dserver_rpc_call_dummy_t*, Message&&) {}
 	};

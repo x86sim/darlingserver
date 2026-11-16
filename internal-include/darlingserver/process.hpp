@@ -20,6 +20,8 @@
 #ifndef _DARLINGSERVER_PROCESS_HPP_
 #define _DARLINGSERVER_PROCESS_HPP_
 
+#include <array>
+#include <atomic>
 #include <sys/types.h>
 #include <memory>
 #include <vector>
@@ -34,11 +36,16 @@
 #include <darlingserver/rpc.h>
 #include <darlingserver/logging.hpp>
 #include <darlingserver/registry.hpp>
+#include <darlingserver/rpc-supplement.h>
 
 struct DTapeHooks;
 
 namespace DarlingServer {
 	class Thread;
+
+	namespace CodeSigning {
+		struct Image;
+	};
 	class Server;
 	class Call;
 
@@ -76,6 +83,21 @@ namespace DarlingServer {
 			// x86Sim: CPU time the process has used (/proc/<pid>/stat utime / stime), microseconds
 			uint64_t userTimeUs;
 			uint64_t systemTimeUs;
+
+			// highest resident size the process has reached (VmHWM, kept monotonic)
+			uint64_t residentSizePeak;
+
+			// Linux's closest analogues of the Mach task_vm_info breakdown, from the
+			// Rss*/VmSwap lines of /proc/<pid>/status (see Process::memoryInfo())
+			uint64_t internalSize; // anonymous and shmem pages (RssAnon + RssShmem)
+			uint64_t externalSize; // file-backed pages (RssFile)
+			uint64_t swappedSize; // pages that are only in swap (VmSwap)
+
+			// internalSize + swappedSize: what the process costs the system
+			uint64_t physFootprint;
+
+			// highest physFootprint seen by any query of this process (sampled)
+			uint64_t physFootprintPeak;
 		};
 
 		struct MemoryRegionInfo {
@@ -98,6 +120,17 @@ namespace DarlingServer {
 		std::string _cachedVchrootPath;
 		std::shared_ptr<FD> _vchrootDescriptor;
 		dtape_task_t* _dtapeTask;
+
+		// highest values returned by memoryInfo() so far, so that the peaks never decrease
+		mutable std::atomic<uint64_t> _residentSizePeak{0};
+		mutable std::atomic<uint64_t> _physFootprintPeak{0};
+
+		// `/proc/<pid>/maps`, kept open for PROCMAP_QUERY region lookups; guarded by its own mutex
+		// so a lookup never issues the ioctl on a descriptor that another thread closed.
+		mutable std::mutex _mapsMutex;
+		mutable int _mapsFd = -1;
+		bool _queryRegion(uintptr_t address, bool coveringOrNext, uintptr_t& start, uintptr_t& end, int& protection, bool& shared, uint64_t& offset) const;
+		void _closeMapsDescriptor();
 		std::weak_ptr<Process> _parentProcess;
 		bool _startSuspended = false;
 		bool _spawnExec = false; // x86Sim: see setSpawnExec
@@ -110,9 +143,16 @@ namespace DarlingServer {
 		Architecture _architecture;
 		std::weak_ptr<Process> _tracerProcess;
 		std::string _executablePath;
+		std::array<uint8_t, 16> _executableUuid = {};
 		bool _dead = false;
 		std::shared_ptr<Process> _selfReference = nullptr;
 		std::vector<uint32_t> _groups;
+
+		// code signing state; see `dserver_cs_state_t`
+		dserver_cs_state_t _csState;
+		std::shared_ptr<const CodeSigning::Image> _csImage;
+		bool _csMayRegister = false;
+		void _resetCodeSigningState();
 
 #if DSERVER_EXTENDED_DEBUG
 		std::unordered_map<uint32_t, uintptr_t> _registeredNames;
@@ -214,9 +254,60 @@ namespace DarlingServer {
 
 		std::shared_ptr<Process> tracerProcess() const;
 		bool setTracerProcess(std::shared_ptr<Process> tracerProcess);
+		/**
+		 * Forgets the tracer, but only if it is `tracerProcess`. Returns whether the process has no tracer afterwards.
+		 */
+		bool clearTracerProcess(std::shared_ptr<Process> tracerProcess);
+
+		/**
+		 * The process's (guest) user ID, as the process itself set it.
+		 */
+		uint32_t guestUID() const;
+
+		/**
+		 * The process's code signing state.
+		 */
+		dserver_cs_state_t codeSigningState() const;
+
+		/**
+		 * The image the process registered, if a signed one was.
+		 */
+		std::shared_ptr<const CodeSigning::Image> codeSigningImage() const;
+
+		/**
+		 * Records the image the process starts from.
+		 *
+		 * @returns `false` if, under the `enforce` policy, the process may not register an image (a
+		 *          forked process, or one that already registered since it started).
+		 */
+		bool registerCodeSigningImage(std::shared_ptr<const CodeSigning::Image> image);
+
+		/**
+		 * Sets and clears `CS_*` flags; the caller decides which ones may be changed.
+		 *
+		 * @returns The new flags.
+		 */
+		uint32_t updateCodeSigningFlags(uint32_t set, uint32_t clear);
+
+		/**
+		 * Records that the process called ptrace(PT_DENY_ATTACH).
+		 */
+		void denyAttach();
+
+		/**
+		 * Records that the process applied a sandbox profile. This cannot be undone; the
+		 * process's forked children and the images it execs stay marked.
+		 */
+		void markSandboxed();
 
 		std::string executablePath() const;
 		void setExecutablePath(std::string path);
+
+		/**
+		 * The LC_UUID of the main executable (all zeros when it has none).
+		 */
+		std::array<uint8_t, 16> executableUuid() const;
+		void setExecutableUuid(const std::array<uint8_t, 16>& uuid);
 
 		uintptr_t allocatePages(size_t pageCount, int protection, uintptr_t addressHint, bool fixed, bool overwrite);
 		void freePages(uintptr_t address, size_t pageCount);

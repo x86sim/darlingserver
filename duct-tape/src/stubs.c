@@ -97,7 +97,6 @@ int cpu_number(void) {
 	return 0;
 };
 
-// x86Sim: fileport_releasefg is in traps.c
 void workq_deallocate_safe(struct workqueue* wq) {
 	dtape_stub();
 };

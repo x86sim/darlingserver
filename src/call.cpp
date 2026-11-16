@@ -29,6 +29,16 @@
 #include <sys/syscall.h>
 #include <darlingserver/kqchan.hpp>
 #include <utility> // x86Sim
+#include <darlingserver/system-config.hpp>
+#include <darlingserver/platform-identity.hpp>
+#include <darlingserver/code-signing.hpp>
+#include <darlingserver/trust-store.hpp>
+#include <darling-config.h>
+#include <kern/cs_blobs.h>
+#include <limits.h>
+#include <list>
+#include <map>
+#include <mutex>
 
 static DarlingServer::Log callLog("calls");
 
@@ -110,12 +120,9 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			throw std::invalid_argument("Invalid call number");
 	}
 
-	// Ported from VibeDarling/darlingserver@c178853 (Cristian Magherusan-Stanciu): only the server's own uid may
-	// talk to it (the socket is 0600 too). The uid is the kernel's (SCM_CREDENTIALS; -1 without credentials), checked
-	// before any process or thread is registered and for unmanaged calls as well. Every client runs as the server's
-	// uid: setuid mode drops to the invoking user before the server starts, userns mode is uid 0 on both sides, guest
-	// setuid is emulated (Uidgid RPC) and never changes the Linux uid.
-	if (requestMessage.uid() != getuid()) {
+	static const uid_t serverUid = getuid();
+
+	if (requestMessage.uid() != serverUid) {
 		throw std::runtime_error("System-reported message UID != darlingserver UID");
 	}
 
@@ -198,9 +205,11 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 		thread->setAddress(requestMessage.address());
 	}
 
-	auto pidString = (process) ? (std::to_string(process->id()) + " (" + std::to_string(process->nsid()) + ")") : (std::to_string(header->pid) + " (-1)");
-	auto tidString = (thread) ? (std::to_string(thread->id()) + " (" + std::to_string(thread->nsid()) + ")") : (std::to_string(header->tid) + " (-1)");
-	callLog.debug() << "Received call #" << header->number << " (" << dserver_callnum_to_string(header->number) << ") from PID " << pidString << ", TID " << tidString << callLog.endLog;
+	if (callLog.enabled(Log::Type::Debug)) {
+		auto pidString = (process) ? (std::to_string(process->id()) + " (" + std::to_string(process->nsid()) + ")") : (std::to_string(header->pid) + " (-1)");
+		auto tidString = (thread) ? (std::to_string(thread->id()) + " (" + std::to_string(thread->nsid()) + ")") : (std::to_string(header->tid) + " (-1)");
+		callLog.debug() << "Received call #" << header->number << " (" << dserver_callnum_to_string(header->number) << ") from PID " << pidString << ", TID " << tidString << callLog.endLog;
+	}
 
 	if (header->number == dserver_callnum_s2c) {
 		// this is an S2C reply
@@ -419,6 +428,7 @@ void DarlingServer::Call::Checkin::processCall() {
 
 void DarlingServer::Call::Checkout::processCall() {
 	int code = 0;
+	bool threadDied = false;
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {
@@ -486,6 +496,7 @@ void DarlingServer::Call::Checkout::processCall() {
 				}
 			} else {
 				thread->notifyDead();
+				threadDied = true;
 
 				// if this was the last thread in the process, it'll be automatically unregistered
 			}
@@ -543,22 +554,6 @@ void DarlingServer::Call::VchrootPath::processCall() {
 void DarlingServer::Call::TaskSelfTrap::processCall() {
 	const auto taskSelfPort = dtape_task_self_trap();
 	_sendReply(0, taskSelfPort);
-};
-
-// x86Sim: fileports (see dtape_fileport_makeport)
-void DarlingServer::Call::FileportMakeport::processCall() {
-	uint32_t name = 0;
-	int code = dtape_fileport_makeport(_body.fd, &name);
-	if (code == 0) {
-		_body.fd = -1; // the fileport owns it now
-	}
-	_sendReply(code, name);
-};
-
-void DarlingServer::Call::FileportMakefd::processCall() {
-	int fd = -1;
-	int code = dtape_fileport_makefd(_body.port_name, &fd);
-	_sendReply(code, fd); // the reply message closes our copy once sent
 };
 
 // x86Sim: see dtape_memfd_for_region
@@ -701,7 +696,7 @@ void DarlingServer::Call::SetThreadHandles::processCall() {
 	int code = 0;
 
 	if (auto thread = _thread.lock()) {
-		thread->setThreadHandles(_body.pthread_handle, _body.dispatch_qaddr);
+		thread->setThreadHandles(_body.pthread_handle, _body.dispatch_qaddr, _body.cancel_marked_addr);
 	} else {
 		code = -ESRCH;
 	}
@@ -739,10 +734,11 @@ void DarlingServer::Call::MldrPath::processCall() {
 
 	if (auto thread = _thread.lock()) {
 		if (auto process = thread->process()) {
-			auto tmpstr = std::string(Config::defaultMldrPath).substr(0, _body.buffer_size - 1);
+			auto mldrPath = Config::defaultMldrPath();
+			auto tmpstr = mldrPath.substr(0, _body.buffer_size - 1);
 			auto len = std::min(tmpstr.length() + 1, _body.buffer_size);
 
-			fullLength = Config::defaultMldrPath.length();
+			fullLength = mldrPath.length();
 
 			if (!process->writeMemory(_body.buffer, tmpstr.c_str(), len, &code)) {
 				// writeMemory returns a positive error code, but we want a negative one
@@ -785,8 +781,25 @@ void DarlingServer::Call::PthreadKill::processCall() {
 void DarlingServer::Call::PthreadCanceled::processCall() {
 	int code = 0;
 
-	callLog.warning() << "TODO: " << __PRETTY_FUNCTION__ << callLog.endLog;
-	code = -ENOSYS;
+	if (auto thread = _thread.lock()) {
+		code = thread->pthreadCanceled(_body.action);
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::PthreadTestcancel::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (!thread->pthreadTestcancel()) {
+			code = -EINVAL;
+		}
+	} else {
+		code = -ESRCH;
+	}
 
 	_sendReply(code);
 };
@@ -794,9 +807,13 @@ void DarlingServer::Call::PthreadCanceled::processCall() {
 void DarlingServer::Call::PthreadMarkcancel::processCall() {
 	int code = 0;
 
-	if (auto targetThread = Thread::threadForPort(_body.thread_port)) {
-		callLog.warning() << "TODO: " << __PRETTY_FUNCTION__ << callLog.endLog;
-		code = -ENOSYS;
+	auto thread = _thread.lock();
+	auto targetThread = Thread::threadForPort(_body.thread_port);
+
+	// like xnu, only accept threads of the caller's own task
+	if (thread && targetThread && targetThread->process() && targetThread->process() == thread->process()) {
+		// a thread that cancels itself is not waiting anywhere
+		targetThread->pthreadMarkcancel(targetThread != thread);
 	} else {
 		code = -ESRCH;
 	}
@@ -858,6 +875,243 @@ void DarlingServer::Call::KqchanProcOpen::processCall() {
 	}
 
 	_sendReply(code, socket);
+};
+
+void DarlingServer::Call::FileportMakeport::processCall() {
+	int code = 0;
+	uint32_t portName = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			if (_body.fd < 0) {
+				code = -EBADF;
+			} else {
+				// the fileport takes ownership of the descriptor
+				int fd = _body.fd;
+				_body.fd = -1;
+
+				switch (dtape_fileport_makeport(process->_dtapeTask, fd, &portName)) {
+					case dtape_fileport_result_ok:
+						break;
+					case dtape_fileport_result_no_resources:
+						code = -EAGAIN;
+						break;
+					case dtape_fileport_result_invalid_port:
+						code = -EINVAL;
+						break;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, portName);
+};
+
+void DarlingServer::Call::FileportMakefd::processCall() {
+	int code = 0;
+	int fd = -1;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			switch (dtape_fileport_makefd(process->_dtapeTask, _body.port_name, &fd)) {
+				case dtape_fileport_result_ok:
+					break;
+				case dtape_fileport_result_no_resources:
+					code = -EMFILE;
+					break;
+				case dtape_fileport_result_invalid_port:
+					// not a send right to a fileport
+					code = -EINVAL;
+					break;
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	// the reply takes ownership of the new descriptor
+	_sendReply(code, fd);
+};
+
+static DarlingServer::Log systemConfigLog("sysconfig");
+
+// raised once by the first accepted push. every waiter passes the count on when it wakes up,
+// so the latch stays raised for later waiters too.
+static dtape_semaphore_t* systemConfigLatch(dtape_task_t* kernelTask) {
+	static std::once_flag once;
+	static dtape_semaphore_t* latch = nullptr;
+	std::call_once(once, [kernelTask]() {
+		latch = dtape_semaphore_create(kernelTask, 0);
+	});
+	return latch;
+};
+
+void DarlingServer::Call::SetSystemConfig::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			int uid = -1;
+			dtape_task_uidgid(process->_dtapeTask, -1, -1, &uid, nullptr);
+
+			// the configuration comes from the root-owned `/Library/Preferences`, so only root may push it.
+			// this is checked before the caller's memory is looked at.
+			if (uid != 0) {
+				code = -EPERM;
+			} else if (_body.config_size != sizeof(dserver_system_config_t)) {
+				code = -EINVAL;
+			} else if (auto latch = systemConfigLatch(Process::kernelProcess()->_dtapeTask); !latch) {
+				code = -ENOMEM;
+			} else {
+				dserver_system_config_t config;
+				bool isFirst = false;
+
+				if (!process->readMemory(_body.config, &config, sizeof(config), &code)) {
+					// readMemory returns a positive error code, but we want a negative one
+					code = -code;
+				} else {
+					code = SystemConfig::sharedInstance().apply(config, isFirst);
+				}
+
+				if (code == 0) {
+					systemConfigLog.info() << "Process " << process->id() << " (" << process->nsid() << ") set the system configuration" << systemConfigLog.endLog;
+					if (isFirst) {
+						dtape_semaphore_up(latch);
+					}
+				} else {
+					systemConfigLog.warning() << "Rejected the system configuration from process " << process->id() << " (" << process->nsid() << "): " << code << systemConfigLog.endLog;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::GetSystemConfig::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			if (_body.config_size != sizeof(dserver_system_config_t)) {
+				code = -EINVAL;
+			} else {
+				auto config = SystemConfig::sharedInstance().current();
+				if (!process->writeMemory(_body.config, &config, sizeof(config), &code)) {
+					// writeMemory returns a positive error code, but we want a negative one
+					code = -code;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::WaitSystemConfig::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (thread->process()) {
+			if (SystemConfig::sharedInstance().current().generation == 0) {
+				if (auto latch = systemConfigLatch(Process::kernelProcess()->_dtapeTask); !latch) {
+					code = -ENOMEM;
+				} else if (dtape_semaphore_down_simple(latch)) {
+					// wake up the next waiter (or leave the latch raised for later ones)
+					dtape_semaphore_up(latch);
+				} else {
+					code = -EINTR;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::SetPlatformIdentity::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			int uid = -1;
+			dtape_task_uidgid(process->_dtapeTask, -1, -1, &uid, nullptr);
+
+			// the identity comes from the root-owned `/Library/Preferences`, so only root may push it.
+			// this is checked before the caller's memory is looked at.
+			if (uid != 0) {
+				code = -EPERM;
+			} else if (_body.identity_size != sizeof(dserver_platform_identity_t)) {
+				code = -EINVAL;
+			} else {
+				dserver_platform_identity_t identity;
+
+				if (!process->readMemory(_body.identity, &identity, sizeof(identity), &code)) {
+					// readMemory returns a positive error code, but we want a negative one
+					code = -code;
+				} else {
+					code = PlatformIdentity::sharedInstance().apply(identity, [](const dserver_platform_identity_t& applied) {
+						// `host_info()` reports the configured memory size, as `hw.memsize` does
+						dtape_host_set_memory_size(applied.memory_size);
+					});
+				}
+
+				if (code == 0) {
+					systemConfigLog.info() << "Process " << process->id() << " (" << process->nsid() << ") set the platform identity" << systemConfigLog.endLog;
+				} else {
+					systemConfigLog.warning() << "Rejected the platform identity from process " << process->id() << " (" << process->nsid() << "): " << code << systemConfigLog.endLog;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::GetPlatformIdentity::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			if (_body.identity_size != sizeof(dserver_platform_identity_t)) {
+				code = -EINVAL;
+			} else {
+				auto identity = PlatformIdentity::sharedInstance().current();
+				if (!process->writeMemory(_body.identity, &identity, sizeof(identity), &code)) {
+					// writeMemory returns a positive error code, but we want a negative one
+					code = -code;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
 };
 
 void DarlingServer::Call::ForkWaitForChild::processCall() {
@@ -1082,7 +1336,18 @@ void DarlingServer::Call::SetTracer::processCall() {
 
 	if (targetProcess) {
 		if (_body.tracer == 0) {
-			// leave tracer process as nullptr
+			// detach: the calling process stops being the tracer. Only the tracer itself may do this.
+			if (_body.target == 0) {
+				code = EPERM;
+			} else if (auto thread = _thread.lock()) {
+				if (!targetProcess->clearTracerProcess(thread->process())) {
+					code = EPERM;
+				}
+			} else {
+				code = -ESRCH;
+			}
+			_sendReply(code);
+			return;
 		} else {
 			if (auto maybeTracerProcess = processRegistry().lookupEntryByNSID(_body.tracer)) {
 				tracerProcess = *maybeTracerProcess;
@@ -1091,6 +1356,10 @@ void DarlingServer::Call::SetTracer::processCall() {
 				// this is a perfectly valid case
 				code = ESRCH;
 			}
+		}
+
+		if (code == 0 && tracerProcess) {
+			code = _mediateAttach(targetProcess, tracerProcess);
 		}
 
 		if (code == 0) {
@@ -1128,8 +1397,11 @@ void DarlingServer::Call::PtraceSigexc::processCall() {
 	if (auto maybeProcess = processRegistry().lookupEntryByNSID(_body.target)) {
 		auto process = *maybeProcess;
 
-		dtape_task_set_sigexc_enabled(process->_dtapeTask, _body.enabled);
-		dtape_task_try_resume(process->_dtapeTask);
+		code = _mediateTracing(process);
+		if (code == 0) {
+			dtape_task_set_sigexc_enabled(process->_dtapeTask, _body.enabled);
+			dtape_task_try_resume(process->_dtapeTask);
+		}
 	} else {
 		// not negated because this isn't an internal error
 		code = ESRCH;
@@ -1143,8 +1415,12 @@ void DarlingServer::Call::PtraceThupdate::processCall() {
 
 	if (auto maybeThread = threadRegistry().lookupEntryByNSID(_body.target)) {
 		auto thread = *maybeThread;
+		auto process = thread->process();
 
-		thread->setPendingSignal(_body.signum);
+		code = process ? _mediateTracing(process) : 0;
+		if (code == 0) {
+			thread->setPendingSignal(_body.signum);
+		}
 	} else {
 		// not negated because this isn't an internal error
 		code = ESRCH;
@@ -1222,6 +1498,164 @@ void DarlingServer::Call::SetExecutablePath::processCall() {
 
 	_sendReply(code);
 }
+
+namespace {
+
+	// The last known path of each file that has been given a file reference. References are shared
+	// between processes, so this can't live in any one of them. The server only remembers these paths:
+	// it never accesses them, and the process asking for a path checks that it still leads to the file.
+	class FileRefPaths {
+	public:
+		void remember(uint64_t device, uint64_t inode, std::string path) {
+			std::unique_lock lock(_mutex);
+			const Key key(device, inode);
+			auto found = _entries.find(key);
+
+			if (found != _entries.end()) {
+				_order.erase(found->second);
+				_entries.erase(found);
+			}
+
+			_order.emplace_front(key, std::move(path));
+			_entries.emplace(key, _order.begin());
+
+			if (_entries.size() > maximumEntries) {
+				_entries.erase(_order.back().first);
+				_order.pop_back();
+			}
+		};
+
+		bool lookup(uint64_t device, uint64_t inode, std::string& path) {
+			std::unique_lock lock(_mutex);
+			auto found = _entries.find(Key(device, inode));
+
+			if (found == _entries.end()) {
+				return false;
+			}
+
+			_order.splice(_order.begin(), _order, found->second);
+			path = found->second->second;
+			return true;
+		};
+
+	private:
+		using Key = std::pair<uint64_t, uint64_t>;
+		using Entry = std::pair<Key, std::string>;
+
+		static constexpr size_t maximumEntries = 65536;
+
+		std::mutex _mutex;
+		std::list<Entry> _order; // most recently used first
+		std::map<Key, std::list<Entry>::iterator> _entries;
+	};
+
+	FileRefPaths fileRefPaths;
+
+};
+
+void DarlingServer::Call::FileRefRegister::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			if (_body.path_length == 0) {
+				code = -EINVAL;
+			} else if (_body.path_length >= PATH_MAX) {
+				code = -ENAMETOOLONG;
+			} else {
+				std::string path;
+				path.resize(_body.path_length);
+
+				if (!process->readMemory((uintptr_t)_body.path, path.data(), _body.path_length, &code)) {
+					code = -code;
+				} else {
+					fileRefPaths.remember(_body.device, _body.inode, std::move(path));
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::FileRefPath::processCall() {
+	int code = 0;
+	uint64_t fullLength = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			std::string path;
+
+			if (!fileRefPaths.lookup(_body.device, _body.inode, path)) {
+				code = -ENOENT;
+			} else {
+				fullLength = path.length();
+
+				if (path.length() >= _body.buffer_size) {
+					code = -ENAMETOOLONG;
+				} else if (!process->writeMemory((uintptr_t)_body.buffer, path.c_str(), path.length() + 1, &code)) {
+					code = -code;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, fullLength);
+};
+
+void DarlingServer::Call::SetExecutableUuid::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			std::array<uint8_t, 16> uuid;
+			if (!process->readMemory((uintptr_t)_body.uuid, uuid.data(), uuid.size(), &code)) {
+				// readMemory returns a positive error code, but we want a negative one
+				code = -code;
+			} else {
+				process->setExecutableUuid(uuid);
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::GetExecutableUuid::processCall() {
+	int code = 0;
+
+	if (auto callingThread = _thread.lock()) {
+		if (auto callingProcess = callingThread->process()) {
+			if (auto maybeTargetProcess = processRegistry().lookupEntryByNSID(_body.pid)) {
+				auto uuid = (*maybeTargetProcess)->executableUuid();
+				if (!callingProcess->writeMemory((uintptr_t)_body.uuid, uuid.data(), uuid.size(), &code)) {
+					code = -code;
+				}
+			} else {
+				// not negated because this is an acceptable case (see GetExecutablePath).
+				code = ESRCH;
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
 
 void DarlingServer::Call::GetExecutablePath::processCall() {
 	int code = 0;
@@ -1398,4 +1832,327 @@ void DarlingServer::Call::DebugListMessages::processCall() {
 	_sendReply(code, portCount, pipes[0]);
 };
 
+void DarlingServer::Call::HostPid::processCall() {
+	int code = 0;
+	int32_t hostPID = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			hostPID = process->id();
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, hostPID);
+};
+
+void DarlingServer::Call::PidForHostPid::processCall() {
+	int code = 0;
+	int32_t pid = 0;
+
+	if (_body.host_pid <= 0) {
+		code = -ESRCH;
+	} else if (auto maybeProcess = processRegistry().lookupEntryByID(_body.host_pid)) {
+		pid = (*maybeProcess)->nsid();
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, pid);
+};
+
 DSERVER_CLASS_SOURCE_DEFS;
+
+//
+// code signing
+//
+
+static DarlingServer::Log codeSigningLog("codesign");
+
+// where the trust store is in the prefix when `TrustStorePath` is not set
+static constexpr const char* defaultTrustStorePath = "/private/var/db/darling/trustcache";
+
+// the key that signs the trust store, in the Darling installation (outside the prefix's writable layer)
+static std::string trustStorePublicKeyPath() {
+	return DarlingServer::Config::libexecPath() + "/private/var/db/darling/trustcache.pub";
+}
+
+static bool trustStoreContains(const uint8_t* cdhash) {
+	auto config = DarlingServer::SystemConfig::sharedInstance().current();
+	std::string path = defaultTrustStorePath;
+	std::string error;
+
+	if (config.trust_store_path[0] != '\0') {
+		path.assign(config.trust_store_path, strnlen(config.trust_store_path, sizeof(config.trust_store_path)));
+	}
+
+	bool found = DarlingServer::TrustStore::sharedInstance().contains(DarlingServer::Server::sharedInstance().prefix(), path, trustStorePublicKeyPath(), cdhash, error);
+
+	if (!error.empty()) {
+		codeSigningLog.warning() << "Cannot use the trust store " << path << ": " << error << codeSigningLog.endLog;
+	}
+
+	return found;
+};
+
+// looks up the process `pid` (0 for the caller); anyone may read the state of any process,
+// only root may change that of another process
+static int lookUpCodeSigningTarget(const std::shared_ptr<DarlingServer::Process>& caller, int32_t pid, bool modify, std::shared_ptr<DarlingServer::Process>& target) {
+	if (pid == 0 || pid == caller->nsid()) {
+		target = caller;
+		return 0;
+	}
+
+	auto maybeTarget = DarlingServer::processRegistry().lookupEntryByNSID(pid);
+	if (!maybeTarget) {
+		return -ESRCH;
+	}
+	target = *maybeTarget;
+
+	return (!modify || caller->guestUID() == 0) ? 0 : -EPERM;
+};
+
+int DarlingServer::Call::_mediateAttach(std::shared_ptr<Process> target, std::shared_ptr<Process> tracer) {
+	using namespace CodeSigning;
+
+	auto state = target->codeSigningState();
+	if (state.code_signing_policy == dserver_code_signing_policy_off) {
+		return 0;
+	}
+
+	bool isSelf = (tracer == target);
+	std::shared_ptr<Process> caller;
+	if (auto thread = _thread.lock()) {
+		caller = thread->process();
+	}
+
+	// only the tracer itself (attaching) or the target (asking to be traced) may set a tracer
+	bool fromParty = caller && (caller == tracer || caller == target);
+
+	auto csr = SystemConfig::sharedInstance().current().csr_active_config;
+	bool allowed = fromParty && attachRule(isSelf, tracer->guestUID(), target->guestUID(), state, csr);
+	auto verdict = applyPolicy(state.code_signing_policy, allowed);
+
+	if (verdict == Verdict::Denied) {
+		codeSigningLog.warning() << "Attaching " << *tracer << " to " << *target << " denied" << codeSigningLog.endLog;
+		// not negated, like the other errors of this call; ptrace() reports EBUSY for a process that denied attachment
+		return (state.darling_flags & DSERVER_CS_DENY_ATTACH) ? EBUSY : EPERM;
+	} else if (verdict == Verdict::WouldDeny) {
+		codeSigningLog.info() << "Attaching " << *tracer << " to " << *target << " would be denied under enforcement" << codeSigningLog.endLog;
+	}
+
+	return 0;
+};
+
+int DarlingServer::Call::_mediateTracing(std::shared_ptr<Process> target) {
+	using namespace CodeSigning;
+
+	auto state = target->codeSigningState();
+	if (state.code_signing_policy == dserver_code_signing_policy_off) {
+		return 0;
+	}
+
+	std::shared_ptr<Process> caller;
+	if (auto thread = _thread.lock()) {
+		caller = thread->process();
+	}
+
+	// only the process's tracer, or the process itself, may change how it is traced
+	bool allowed = caller && (caller == target || caller == target->tracerProcess());
+	auto verdict = applyPolicy(state.code_signing_policy, allowed);
+
+	if (verdict == Verdict::Denied) {
+		codeSigningLog.warning() << "Tracing request for " << *target << " from a process that is not its tracer denied" << codeSigningLog.endLog;
+		// not negated, like the other errors of these calls
+		return EPERM;
+	} else if (verdict == Verdict::WouldDeny) {
+		codeSigningLog.info() << "Tracing request for " << *target << " from a process that is not its tracer would be denied under enforcement" << codeSigningLog.endLog;
+	}
+
+	return 0;
+};
+
+void DarlingServer::Call::CsRegisterImage::processCall() {
+	int code = 0;
+	uint32_t flags = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			// read before anything is recorded; the descriptor stays ours (and is closed with the call).
+			// pages and the CMS signature are only checked when the process's policy asks for it.
+			auto policy = process->codeSigningState().code_signing_policy;
+			auto image = std::make_shared<CodeSigning::Image>(CodeSigning::verifyImage(_body.image, _body.image_offset, CodeSigning::checksForPolicy(policy), trustStoreContains));
+
+			if (!process->registerCodeSigningImage(image)) {
+				code = -EPERM;
+			} else {
+				flags = image->state.flags;
+				if (image->state.status == dserver_cs_status_invalid && !image->error.empty()) {
+					codeSigningLog.info() << *process << ": the image's signature is not valid: " << image->error << codeSigningLog.endLog;
+				} else if (policy == dserver_code_signing_policy_warn && !image->error.empty()) {
+					codeSigningLog.warning() << *process << ": the image's signature would not be valid under enforcement: " << image->error << codeSigningLog.endLog;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, flags);
+};
+
+void DarlingServer::Call::CsGetState::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			std::shared_ptr<Process> target;
+
+			if (_body.state_size != sizeof(dserver_cs_state_t)) {
+				code = -EINVAL;
+			} else if ((code = lookUpCodeSigningTarget(process, _body.pid, false, target)) == 0) {
+				auto state = target->codeSigningState();
+				if (!process->writeMemory(_body.state, &state, sizeof(state), &code)) {
+					code = -code;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::CsCopyEntitlements::processCall() {
+	int code = 0;
+	uint64_t length = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			std::shared_ptr<Process> target;
+
+			if ((code = lookUpCodeSigningTarget(process, _body.pid, false, target)) == 0) {
+				if (auto image = target->codeSigningImage()) {
+					const auto& blob = _body.der ? image->derEntitlements : image->entitlements;
+					length = blob.size();
+
+					if (length > _body.buffer_size) {
+						code = -ERANGE;
+					} else if (length > 0 && !process->writeMemory(_body.buffer, blob.data(), blob.size(), &code)) {
+						code = -code;
+					}
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, length);
+};
+
+void DarlingServer::Call::CsUpdateFlags::processCall() {
+	int code = 0;
+	uint32_t flags = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			std::shared_ptr<Process> target;
+
+			if ((_body.set_flags & ~CodeSigning::settableFlags()) != 0 || (_body.clear_flags & ~CodeSigning::clearableFlags()) != 0) {
+				code = -EINVAL;
+			} else if ((code = lookUpCodeSigningTarget(process, _body.pid, true, target)) == 0) {
+				if ((_body.clear_flags & CodeSigning::libraryValidationFlags()) != 0) {
+					// a process can only turn its own library validation off
+					auto image = target->codeSigningImage();
+					if (target != process || !CodeSigning::clearLibraryValidationRule(target->codeSigningState().code_signing_policy, image ? *image : CodeSigning::Image())) {
+						code = -EPERM;
+					}
+				}
+				if (code == 0) {
+					flags = target->updateCodeSigningFlags(_body.set_flags, _body.clear_flags);
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, flags);
+};
+
+void DarlingServer::Call::CsDenyAttach::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			process->denyAttach();
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::CsMarkSandboxed::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			process->markSandboxed();
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::CsVerifyImage::processCall() {
+	int code = 0;
+	uint32_t status = dserver_cs_status_invalid;
+	uint32_t flags = 0;
+	uint64_t codeLimit = 0;
+	uint32_t pageSizeLog2 = 0;
+	bool libraryValidationOk = false;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			auto state = process->codeSigningState();
+			bool enforced = state.code_signing_policy == dserver_code_signing_policy_enforce;
+			auto library = CodeSigning::verifyImage(_body.image, _body.image_offset, CodeSigning::checksForPolicy(state.code_signing_policy), trustStoreContains);
+			auto mainImage = process->codeSigningImage();
+			std::string error;
+
+			status = library.state.status;
+			flags = library.state.flags;
+			codeLimit = library.state.code_limit;
+			pageSizeLog2 = library.pageSizeLog2;
+			// library validation only refuses anything under enforcement
+			libraryValidationOk = !enforced || CodeSigning::libraryValidationAllows(state, mainImage ? *mainImage : CodeSigning::Image(), library, error);
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, status, flags, codeLimit, pageSizeLog2, libraryValidationOk);
+};

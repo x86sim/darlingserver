@@ -6,8 +6,10 @@
 #include <kern/timer_queue.h>
 #include <mach/mach_time.h>
 
+#if __x86_64__ || __i386__
 #include <i386/rtclock_protos.h>
 #include <i386/pal_native.h>
+#endif
 
 #define CLOCK_MONOTONIC 1
 
@@ -32,8 +34,9 @@ struct timespec
 
 int clock_gettime(int clk_id, struct timespec *tp);
 
-// stub
+#if __x86_64__ || __i386__
 pal_rtc_nanotime_t pal_rtc_nanotime_info;
+#endif
 
 int master_cpu = 0;
 
@@ -46,11 +49,13 @@ void dtape_timer_init(void) {
 	mpqueue_init(&timer_queue, LCK_GRP_NULL, LCK_ATTR_NULL);
 };
 
+#if __x86_64__ || __i386__
 uint64_t _rtc_nanotime_read(pal_rtc_nanotime_t* rntp) {
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (ts.tv_sec * NSEC_PER_SEC) + ts.tv_nsec;
 };
+#endif
 
 static uint64_t dtape_timer_queue_head_deadline_locked(mpqueue_head_t* queue) {
 	timer_call_t head = priority_queue_min(&queue->mpq_pqhead, struct timer_call, tc_pqlink);
@@ -70,13 +75,9 @@ void dtape_timer_queue_changed_locked(mpqueue_head_t* queue) {
 };
 
 void dtape_timer_fired(void) {
+	// Expiration rearms the timer under the queue lock (see timer_call.c). Doing it here, with
+	// the deadline it returned, could overwrite the deadline of a call inserted in the meantime.
 	timer_queue_expire(&timer_queue, mach_absolute_time());
-
-	// re-arm for the queue's head under its lock, rather than for the deadline timer_queue_expire() returned after
-	// unlocking it, which may predate a timer enqueued since
-	lck_mtx_lock_spin_always(&timer_queue.lock_data);
-	dtape_hooks->timer_arm(dtape_timer_queue_head_deadline_locked(&timer_queue), true);
-	lck_mtx_unlock_always(&timer_queue.lock_data);
 };
 
 void timer_call_nosync_cpu(int cpu, void (*fn)(void* arg), void* arg) {
@@ -84,7 +85,8 @@ void timer_call_nosync_cpu(int cpu, void (*fn)(void* arg), void* arg) {
 };
 
 mpqueue_head_t* timer_queue_assign(uint64_t deadline) {
-	dtape_hooks->timer_arm(deadline, false);
+	// The timer is armed after insertion (see timer_call.c): a short deadline
+	// could otherwise expire before its call has reached the queue, and never fire.
 	return &timer_queue;
 };
 

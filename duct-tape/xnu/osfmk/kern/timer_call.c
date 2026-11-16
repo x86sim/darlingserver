@@ -45,6 +45,10 @@
 #include <mach/sdt.h>
 #endif
 
+#ifdef __DARLING__
+#include <darlingserver/duct-tape/log.h>
+#endif
+
 
 #if DEBUG
 #define TIMER_ASSERT    1
@@ -388,6 +392,11 @@ timer_call_entry_enqueue_deadline(
 		old_mpqueue->count--;
 	}
 	new_mpqueue->count++;
+
+#ifdef __DARLING__
+	// Arm the timer for the actual head of the queue, under the queue lock.
+	timer_queue_cancel(new_mpqueue, deadline, thead->tc_pqlink.deadline);
+#endif
 
 	return old_mpqueue;
 }
@@ -892,6 +901,22 @@ timer_queue_expire_with_options(
 			}
 		}
 
+		if (call == NULL) {
+			break;
+		}
+#ifdef __DARLING__
+		if (rescan == FALSE && call->tc_queue != &queue->head) {
+			dtape_log_warning("timer_queue_expire: head entry %p not linked to queue %p, removing from priority queue", call, queue);
+			priority_queue_remove(&queue->mpq_pqhead, &call->tc_pqlink);
+			call = NULL;
+			continue;
+		}
+		if (tc_iterations > 50000) {
+			dtape_log_warning("timer_queue_expire: runaway iteration limit (%u) reached on queue %p, breaking loop", tc_iterations, queue);
+			break;
+		}
+#endif
+
 		if (call->tc_soft_deadline <= cur_deadline) {
 			timer_call_func_t               func;
 			timer_call_param_t              param0, param1;
@@ -1011,6 +1036,9 @@ timer_queue_expire_with_options(
 		queue->earliest_soft_deadline = cur_deadline = UINT64_MAX;
 	}
 
+#ifdef __DARLING__
+	timer_queue_cancel(queue, deadline, cur_deadline);
+#endif
 	timer_queue_unlock(queue);
 
 	return cur_deadline;

@@ -127,6 +127,22 @@ add_compile_definitions(
 	__DARWIN_BYTE_ORDER=__DARWIN_LITTLE_ENDIAN
 )
 
+# On Android (Bionic libc) and platforms lacking bcmp(), map it to memcmp
+# which has identical equality semantics (returns zero iff memory regions match).
+if (ANDROID OR DSERVER_BIONIC)
+	add_compile_definitions(bcmp=memcmp)
+else()
+	include(CheckSymbolExists)
+	check_symbol_exists(bcmp "strings.h" HAVE_BCMP)
+	if (NOT HAVE_BCMP)
+		add_compile_definitions(bcmp=memcmp)
+	endif()
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64")
+	add_compile_definitions(__arm64__ APPLE_ARM64_ARCH_FAMILY VMAPPLE ARM64_BOARD_CONFIG_VMAPPLE __ARM_VMSA__=8 __ARM64_PMAP_SUBPAGE_L1__)
+endif()
+
 add_compile_options(
 	-fblocks
 	-ffunction-sections
@@ -271,6 +287,8 @@ add_library(darlingserver_duct_tape STATIC
 	src/eventlink.c
 	src/condvar.c
 	src/debug.c
+	src/fileport.c
+	src/csr.c
 
 	xnu/libkern/os/refcnt.c
 	xnu/libkern/gen/OSAtomicOperations.c
@@ -322,7 +340,7 @@ add_library(darlingserver_duct_tape STATIC
 	xnu/osfmk/ipc/mig_log.c
 	xnu/osfmk/ipc/ipc_eventlink.c
 
-	xnu/osfmk/i386/rtclock.c
+	$<IF:$<STREQUAL:${CMAKE_SYSTEM_PROCESSOR},aarch64>,src/rtclock_arm64.c,xnu/osfmk/i386/rtclock.c>
 
 	xnu/osfmk/prng/prng_random.c
 

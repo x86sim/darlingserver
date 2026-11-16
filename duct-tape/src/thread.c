@@ -10,10 +10,21 @@
 #include <kern/ipc_tt.h>
 #include <kern/policy_internal.h>
 #include <mach/thread_act.h>
+#if defined(__aarch64__)
+#include <mach/arm/thread_status.h>
+#include <mach/arm/exception.h>
+#endif
 #include <sys/systm.h>
 #include <sys/ux_exception.h>
 
 #include <stdlib.h>
+
+// On ARM64, arm/cpu_data.h defines current_thread() as a macro expanding to
+// current_thread_fast(). We need to undef it because Darling defines its own
+// current_thread() function and uses dtape_hooks->current_thread().
+#ifdef current_thread
+#undef current_thread
+#endif
 
 #include <rtsig.h>
 
@@ -43,6 +54,8 @@ kern_return_t thread_set_state(register thread_t thread, int flavor, thread_stat
 
 kern_return_t thread_get_state(thread_t thread, int flavor, thread_state_t state, mach_msg_type_number_t* state_count);
 
+thread_t current_thread(void);
+
 dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* context) {
 	dtape_thread_t* thread = malloc(sizeof(dtape_thread_t));
 	if (!thread) {
@@ -60,6 +73,7 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 	dtape_condvar_init(&thread->suspension_condvar);
 	memset(&thread->xnu_thread, 0, sizeof(thread->xnu_thread));
 	memset(&thread->kwe, 0, sizeof(thread->kwe));
+	thread->uu_flag = 0;
 
 	memset(&thread->default_state, 0, sizeof(thread->default_state));
 	LIST_INSERT_HEAD(&thread->user_states, &thread->default_state, link);
@@ -206,6 +220,7 @@ void* dtape_thread_context(dtape_thread_t* thread) {
 int dtape_thread_load_state_from_user(dtape_thread_t* thread, uintptr_t thread_state_address, uintptr_t float_state_address) {
 	dtape_task_t* task = dtape_task_for_thread(thread);
 
+#if __x86_64__ || __i386__
 	if (task->architecture == dserver_rpc_architecture_x86_64) {
 		x86_thread_state64_t tstate;
 		x86_float_state64_t fstate;
@@ -226,7 +241,22 @@ int dtape_thread_load_state_from_user(dtape_thread_t* thread, uintptr_t thread_s
 
 		thread_set_state(current_thread(), x86_THREAD_STATE32, (thread_state_t) &tstate, x86_THREAD_STATE32_COUNT);
 		thread_set_state(current_thread(), x86_FLOAT_STATE32, (thread_state_t) &fstate, x86_FLOAT_STATE32_COUNT);
-	} else {
+	} else
+#endif
+#if __aarch64__
+	if (task->architecture == dserver_rpc_architecture_arm64) {
+		arm_thread_state64_t tstate;
+		arm_neon_state64_t fstate;
+
+		if (copyin(thread_state_address, &tstate, sizeof(tstate)) || copyin(float_state_address, &fstate, sizeof(fstate))) {
+			return -LINUX_EFAULT;
+		}
+
+		thread_set_state(current_thread(), ARM_THREAD_STATE64, (thread_state_t) &tstate, ARM_THREAD_STATE64_COUNT);
+		thread_set_state(current_thread(), ARM_NEON_STATE64, (thread_state_t) &fstate, ARM_NEON_STATE64_COUNT);
+	} else
+#endif
+	{
 		dtape_log_error("dtape_thread_load_state_from_user() unimplemented for architecture: %d", task->architecture);
 		return -LINUX_ENOSYS;
 	}
@@ -237,6 +267,7 @@ int dtape_thread_load_state_from_user(dtape_thread_t* thread, uintptr_t thread_s
 int dtape_thread_save_state_to_user(dtape_thread_t* thread, uintptr_t thread_state_address, uintptr_t float_state_address) {
 	dtape_task_t* task = dtape_task_for_thread(thread);
 
+#if __x86_64__ || __i386__
 	if (task->architecture == dserver_rpc_architecture_x86_64) {
 		x86_thread_state64_t tstate;
 		x86_float_state64_t fstate;
@@ -265,7 +296,26 @@ int dtape_thread_save_state_to_user(dtape_thread_t* thread, uintptr_t thread_sta
 		if (copyout(&tstate, thread_state_address, sizeof(tstate)) || copyout(&fstate, float_state_address, sizeof(fstate))) {
 			return -LINUX_EFAULT;
 		}
-	} else {
+	} else
+#endif
+#if __aarch64__
+	if (task->architecture == dserver_rpc_architecture_arm64) {
+		arm_thread_state64_t tstate;
+		arm_neon_state64_t fstate;
+		mach_msg_type_number_t count;
+
+		count = ARM_THREAD_STATE64_COUNT;
+		thread_get_state(current_thread(), ARM_THREAD_STATE64, (thread_state_t) &tstate, &count);
+
+		count = ARM_NEON_STATE64_COUNT;
+		thread_get_state(current_thread(), ARM_NEON_STATE64, (thread_state_t) &fstate, &count);
+
+		if (copyout(&tstate, thread_state_address, sizeof(tstate)) || copyout(&fstate, float_state_address, sizeof(fstate))) {
+			return -LINUX_EFAULT;
+		}
+	} else
+#endif
+	{
 		dtape_log_error("dtape_thread_save_state_to_user() unimplemented for architecture: %d", task->architecture);
 		return -LINUX_ENOSYS;
 	}
@@ -300,11 +350,19 @@ void dtape_thread_process_signal(dtape_thread_t* thread, int bsd_signal_number, 
 			break;
 		case LINUX_SIGBUS:
 			mach_exception = EXC_BAD_ACCESS;
+#if defined(__aarch64__)
+			codes[0] = EXC_ARM_DA_ALIGN;
+#else
 			codes[0] = EXC_I386_ALIGNFLT;
+#endif
 			break;
 		case LINUX_SIGILL:
 			mach_exception = EXC_BAD_INSTRUCTION;
+#if defined(__aarch64__)
+			codes[0] = EXC_ARM_UNDEFINED;
+#else
 			codes[0] = EXC_I386_INVOP;
+#endif
 			break;
 		case LINUX_SIGFPE:
 			mach_exception = EXC_ARITHMETIC;
@@ -312,7 +370,11 @@ void dtape_thread_process_signal(dtape_thread_t* thread, int bsd_signal_number, 
 			break;
 		case LINUX_SIGTRAP:
 			mach_exception = EXC_BREAKPOINT;
+#if defined(__aarch64__)
+			codes[0] = EXC_ARM_BREAKPOINT;
+#else
 			codes[0] = (code == LINUX_SI_KERNEL) ? EXC_I386_BPT : EXC_I386_SGL;
+#endif
 
 			if (code == LINUX_TRAP_HWBKPT) {
 #if 0
@@ -594,6 +656,7 @@ wait_result_t thread_block(thread_continue_t continuation) {
 // thread locked
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
+
 	thread->xnu_thread.wait_result = wresult;
 	// as XNU does: a timed wait that ended otherwise must not time out a later wait
 	if (thread->xnu_thread.wait_timer_is_set) {
@@ -618,12 +681,26 @@ kern_return_t thread_go(thread_t thread, wait_result_t wresult, waitq_options_t 
 };
 
 wait_result_t thread_mark_wait_locked(thread_t thread, wait_interrupt_t interruptible_orig) {
-	dtape_stub_safe();
-	thread->state = TH_WAIT;
-	thread->wait_result = THREAD_WAITING;
-	thread->block_hint = thread->pending_block_hint;
+	// the abort handling is adapted from XNU's thread_mark_wait_locked() in osfmk/kern/sched_prim.c
+	wait_interrupt_t interruptible = interruptible_orig & TH_OPT_INTMASK;
+	boolean_t at_safe_point = (interruptible == THREAD_ABORTSAFE);
+
+	if (interruptible == THREAD_UNINT ||
+	    !(thread->sched_flags & TH_SFLAG_ABORT) ||
+	    (!at_safe_point && (thread->sched_flags & TH_SFLAG_ABORTSAFELY))) {
+		thread->state = TH_WAIT;
+		thread->at_safe_point = at_safe_point;
+		thread->wait_result = THREAD_WAITING;
+		thread->block_hint = thread->pending_block_hint;
+		thread->pending_block_hint = kThreadWaitNone;
+		return THREAD_WAITING;
+	}
+
+	if (thread->sched_flags & TH_SFLAG_ABORTSAFELY) {
+		thread->sched_flags &= ~TH_SFLAG_ABORTED_MASK;
+	}
 	thread->pending_block_hint = kThreadWaitNone;
-	return THREAD_WAITING;
+	return thread->wait_result = THREAD_INTERRUPTED;
 };
 
 kern_return_t thread_terminate(thread_t xthread) {
@@ -680,6 +757,7 @@ thread_set_state(
 	dtape_task_t* dtask = dtape_task_for_thread(dthread);
 	dtape_thread_user_state_t* user_state = LIST_FIRST(&dthread->user_states);
 
+#if __x86_64__ || __i386__
 	if (dtask->architecture == dserver_rpc_architecture_x86_64 || dtask->architecture == dserver_rpc_architecture_i386) {
 		switch (flavor)
 		{
@@ -841,7 +919,7 @@ thread_set_state(
 				s64.dr6 = s->dr6;
 				s64.dr7 = s->dr7;
 
-				return thread_set_state(thread, x86_DEBUG_STATE64, (thread_state_t) &s,
+				return thread_set_state(thread, x86_DEBUG_STATE64, (thread_state_t) &s64,
 						x86_DEBUG_STATE64_COUNT);
 			}
 			case x86_DEBUG_STATE64:
@@ -909,6 +987,58 @@ thread_set_state(
 				return KERN_INVALID_ARGUMENT;
 		}
 	}
+#endif
+#if __aarch64__
+	if (dtask->architecture == dserver_rpc_architecture_arm64) {
+		switch (flavor)
+		{
+			case ARM_THREAD_STATE64:
+			{
+				if (state_count < ARM_THREAD_STATE64_COUNT)
+					return KERN_INVALID_ARGUMENT;
+
+				const arm_thread_state64_t* s = (arm_thread_state64_t*) state;
+
+				memcpy(&user_state->thread_state.ts_64, s, sizeof(*s));
+				return KERN_SUCCESS;
+			}
+			case ARM_NEON_STATE64:
+			{
+				if (state_count < ARM_NEON_STATE64_COUNT)
+					return KERN_INVALID_ARGUMENT;
+
+				const arm_neon_state64_t* s = (arm_neon_state64_t*) state;
+
+				memcpy(&user_state->float_state, s, sizeof(*s));
+				return KERN_SUCCESS;
+			}
+			case ARM_THREAD_STATE:
+			{
+				// Unified thread state: auto-select 64-bit for ARM64 tasks
+				arm_thread_state64_t* s64 = (arm_thread_state64_t*) state;
+				if (state_count < ARM_THREAD_STATE64_COUNT)
+					return KERN_INVALID_ARGUMENT;
+
+				memcpy(&user_state->thread_state.ts_64, s64, sizeof(*s64));
+				return KERN_SUCCESS;
+			}
+			case ARM_DEBUG_STATE64:
+			{
+				if (state_count < ARM_DEBUG_STATE64_COUNT)
+					return KERN_INVALID_ARGUMENT;
+				// No hardware debug registers can be installed yet. Restoring an
+				// inactive state is valid; retain an explicit error for active ones.
+				const unsigned char* bytes = (const unsigned char*) state;
+				for (size_t i = 0; i < sizeof(arm_debug_state64_t); ++i)
+					if (bytes[i] != 0)
+						return KERN_NOT_SUPPORTED;
+				return KERN_SUCCESS;
+			}
+			default:
+				return KERN_INVALID_ARGUMENT;
+		}
+	}
+#endif
 	return KERN_FAILURE;
 }
 
@@ -928,6 +1058,7 @@ thread_get_state_internal(
 	// it currently only does something on ARM64 when the authenticated pointers (`ptrauth_calls`) feature is enabled,
 	// so i think it's safe to say we can ignore it in Darling (even when we get ARM support)
 
+#if __x86_64__ || __i386__
 	if (dtask->architecture == dserver_rpc_architecture_x86_64 || dtask->architecture == dserver_rpc_architecture_i386) {
 		switch (flavor)
 		{
@@ -1160,9 +1291,64 @@ thread_get_state_internal(
 			default:
 				return KERN_INVALID_ARGUMENT;
 		}
-	} else {
-		return KERN_FAILURE;
 	}
+#endif
+#if __aarch64__
+	if (dtask->architecture == dserver_rpc_architecture_arm64) {
+		switch (flavor)
+		{
+			case ARM_THREAD_STATE64:
+			{
+				if (*state_count < ARM_THREAD_STATE64_COUNT)
+					return KERN_INVALID_ARGUMENT;
+
+				arm_thread_state64_t* s = (arm_thread_state64_t*) state;
+				*state_count = ARM_THREAD_STATE64_COUNT;
+
+				memcpy(s, &user_state->thread_state.ts_64, sizeof(*s));
+
+				return KERN_SUCCESS;
+			}
+			case ARM_NEON_STATE64:
+			{
+				if (*state_count < ARM_NEON_STATE64_COUNT)
+					return KERN_INVALID_ARGUMENT;
+
+				arm_neon_state64_t* s = (arm_neon_state64_t*) state;
+				*state_count = ARM_NEON_STATE64_COUNT;
+
+				memcpy(s, &user_state->float_state, sizeof(*s));
+
+				return KERN_SUCCESS;
+			}
+			case ARM_THREAD_STATE:
+			{
+				// Unified thread state: return 64-bit for ARM64 tasks
+				arm_thread_state64_t* s = (arm_thread_state64_t*) state;
+				if (*state_count < ARM_THREAD_STATE64_COUNT)
+					return KERN_INVALID_ARGUMENT;
+
+				*state_count = ARM_THREAD_STATE64_COUNT;
+				memcpy(s, &user_state->thread_state.ts_64, sizeof(*s));
+
+				return KERN_SUCCESS;
+			}
+			case ARM_DEBUG_STATE64:
+			{
+				if (*state_count < ARM_DEBUG_STATE64_COUNT)
+					return KERN_INVALID_ARGUMENT;
+				// XNU returns a zero debug state for threads with no DebugData.
+				// Darling currently cannot install active ARM64 debug registers.
+				memset(state, 0, sizeof(arm_debug_state64_t));
+				*state_count = ARM_DEBUG_STATE64_COUNT;
+				return KERN_SUCCESS;
+			}
+			default:
+				return KERN_INVALID_ARGUMENT;
+		}
+	}
+#endif
+	return KERN_FAILURE;
 }
 
 kern_return_t
@@ -1259,13 +1445,37 @@ kern_return_t thread_abort(thread_t thread) {
 };
 
 kern_return_t thread_abort_safely(thread_t thread) {
-	// TODO: actually do something?
-	//       in the LKM, we used to call `kick_process` here
-	//       (which would presumably interrupt any syscalls).
-	//       to replicate that, we'd probably have to use another
-	//       real-time signal with SA_RESTART off.
-	dtape_stub();
+	// this only interrupts waits inside darlingserver;
+	// in the LKM, we used to call `kick_process` here
+	// (which would presumably interrupt any syscalls).
+	// to replicate that, we'd probably have to use another
+	// real-time signal with SA_RESTART off.
+	//
+	// the rest is adapted from XNU's thread_abort_safely() in osfmk/kern/thread_act.c
+	thread_lock(thread);
+	if (!thread->at_safe_point || clear_wait_internal(thread, THREAD_INTERRUPTED) != KERN_SUCCESS) {
+		if (!(thread->sched_flags & TH_SFLAG_ABORT)) {
+			thread->sched_flags |= TH_SFLAG_ABORTED_MASK;
+		}
+	}
+	thread_unlock(thread);
 	return KERN_SUCCESS;
+};
+
+void dtape_thread_returning_to_user(dtape_thread_t* thread) {
+	thread_t xthread = &thread->xnu_thread;
+
+	// in XNU, an abort that did not interrupt a wait only lasts until the thread returns to user space,
+	// where thread_apc_ast() clears it. our threads "return to user space" when a call replies.
+	// (an abort set while the thread was already in user space instead lasts until its next call replies;
+	// that covers the window between libsystem_kernel's TSD check and the call that starts the wait.)
+	if (!(xthread->sched_flags & TH_SFLAG_ABORTED_MASK)) {
+		return;
+	}
+
+	thread_lock(xthread);
+	xthread->sched_flags &= ~TH_SFLAG_ABORTED_MASK;
+	thread_unlock(xthread);
 };
 
 kern_return_t thread_convert_thread_state(thread_t thread, int direction, thread_state_flavor_t flavor, thread_state_t in_state, mach_msg_type_number_t in_state_count, thread_state_t out_state, mach_msg_type_number_t* out_state_count) {
@@ -1459,6 +1669,8 @@ kern_return_t thread_info(thread_t xthread, thread_flavor_t flavor, thread_info_
 
 		// as XNU: a flavor it doesn't know is an invalid argument
 		default:
+			// the flavor is guest-controlled: reject it as XNU does, never abort the server
+			dtape_log_debug("%s: unsupported flavor %u", __FUNCTION__, flavor);
 			return KERN_INVALID_ARGUMENT;
 	}
 };
@@ -1468,90 +1680,105 @@ kern_return_t thread_policy(thread_t thread, policy_t policy, policy_base_t base
 	return KERN_SUCCESS;
 };
 
-// threads are scheduled by Linux: every policy is XNU's default for a time-shared thread
+// Darling keeps no per-thread scheduling policy (thread_policy_set accepts and ignores it), so every
+// thread reports what a thread with nothing set reports on macOS. Each flavor fills in only its own
+// count of integers; `get_default` is left as the caller passed it unless noted.
 kern_return_t thread_policy_get(thread_t thread, thread_policy_flavor_t flavor, thread_policy_t policy_info, mach_msg_type_number_t* count, boolean_t* get_default) {
-	if (thread == THREAD_NULL) {
+	if (!thread || !policy_info || !count || !get_default) {
 		return KERN_INVALID_ARGUMENT;
 	}
 
 	switch (flavor) {
 		case THREAD_EXTENDED_POLICY: {
+			// QUIRK: a count smaller than THREAD_EXTENDED_POLICY_COUNT is not an error for this flavor:
+			// the call succeeds and returns nothing, with the count unchanged (0 stays 0).
+			// Not documented. Evidence: black-box observation on macOS 27, arm64 and x86_64 under
+			// Rosetta (tier 2).
+			// Test: tests/src/thread_policy_get.c (main tree), "EXTENDED with count 0".
 			if (*count < THREAD_EXTENDED_POLICY_COUNT) {
-				return KERN_INVALID_ARGUMENT;
+				return KERN_SUCCESS;
 			}
 			((thread_extended_policy_t)policy_info)->timeshare = TRUE;
 			*count = THREAD_EXTENDED_POLICY_COUNT;
-			break;
-		};
+			return KERN_SUCCESS;
+		}
 
 		case THREAD_TIME_CONSTRAINT_POLICY: {
 			if (*count < THREAD_TIME_CONSTRAINT_POLICY_COUNT) {
 				return KERN_INVALID_ARGUMENT;
 			}
+			// QUIRK: a thread that is not real-time reports period 0, computation 5 ms, constraint
+			// 10 ms (both in absolute time units) and preemptible TRUE, and get_default is set to TRUE.
+			// Not documented. Evidence: black-box observation on macOS 27, arm64 and x86_64 under
+			// Rosetta (tier 2).
+			// Test: tests/src/thread_policy_get.c (main tree), "TIME_CONSTRAINT".
 			thread_time_constraint_policy_t info = (thread_time_constraint_policy_t)policy_info;
-			// XNU's defaults: half a 10 ms quantum to compute in, a whole one to finish by (Darling's absolute
-			// time is in nanoseconds)
+			uint64_t computation, constraint;
+			nanoseconds_to_absolutetime(5 * NSEC_PER_MSEC, &computation);
+			nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &constraint);
 			info->period = 0;
-			info->computation = 5 * NSEC_PER_MSEC;
-			info->constraint = 10 * NSEC_PER_MSEC;
+			info->computation = (uint32_t)computation;
+			info->constraint = (uint32_t)constraint;
 			info->preemptible = TRUE;
 			*count = THREAD_TIME_CONSTRAINT_POLICY_COUNT;
-			break;
-		};
+			*get_default = TRUE;
+			return KERN_SUCCESS;
+		}
 
-		case THREAD_PRECEDENCE_POLICY: {
+		case THREAD_PRECEDENCE_POLICY:
 			if (*count < THREAD_PRECEDENCE_POLICY_COUNT) {
 				return KERN_INVALID_ARGUMENT;
 			}
 			((thread_precedence_policy_t)policy_info)->importance = 0;
 			*count = THREAD_PRECEDENCE_POLICY_COUNT;
-			break;
-		};
+			return KERN_SUCCESS;
 
-		case THREAD_AFFINITY_POLICY: {
-			if (*count < THREAD_AFFINITY_POLICY_COUNT) {
-				return KERN_INVALID_ARGUMENT;
-			}
-			((thread_affinity_policy_t)policy_info)->affinity_tag = THREAD_AFFINITY_TAG_NULL;
-			*count = THREAD_AFFINITY_POLICY_COUNT;
-			break;
-		};
-
-		case THREAD_LATENCY_QOS_POLICY: {
+		case THREAD_LATENCY_QOS_POLICY:
 			if (*count < THREAD_LATENCY_QOS_POLICY_COUNT) {
 				return KERN_INVALID_ARGUMENT;
 			}
 			((thread_latency_qos_policy_t)policy_info)->thread_latency_qos_tier = LATENCY_QOS_TIER_UNSPECIFIED;
 			*count = THREAD_LATENCY_QOS_POLICY_COUNT;
-			break;
-		};
+			return KERN_SUCCESS;
 
-		case THREAD_THROUGHPUT_QOS_POLICY: {
+		case THREAD_THROUGHPUT_QOS_POLICY:
 			if (*count < THREAD_THROUGHPUT_QOS_POLICY_COUNT) {
 				return KERN_INVALID_ARGUMENT;
 			}
 			((thread_throughput_qos_policy_t)policy_info)->thread_throughput_qos_tier = THROUGHPUT_QOS_TIER_UNSPECIFIED;
 			*count = THREAD_THROUGHPUT_QOS_POLICY_COUNT;
-			break;
-		};
+			return KERN_SUCCESS;
 
 		case THREAD_QOS_POLICY: {
 			if (*count < THREAD_QOS_POLICY_COUNT) {
 				return KERN_INVALID_ARGUMENT;
 			}
+			// QUIRK: a thread with no QoS set reports THREAD_QOS_LEGACY with relative priority 0, but
+			// the default asked for with get_default TRUE is THREAD_QOS_UNSPECIFIED.
+			// Not documented. Evidence: black-box observation on macOS 27, arm64 and x86_64 under
+			// Rosetta (tier 2).
+			// Test: tests/src/thread_policy_get.c (main tree), "QOS".
 			thread_qos_policy_t info = (thread_qos_policy_t)policy_info;
-			info->qos_tier = THREAD_QOS_UNSPECIFIED;
+			info->qos_tier = *get_default ? THREAD_QOS_UNSPECIFIED : THREAD_QOS_LEGACY;
 			info->tier_importance = 0;
 			*count = THREAD_QOS_POLICY_COUNT;
-			break;
-		};
+			return KERN_SUCCESS;
+		}
 
+		// QUIRK: affinity sets are not supported (KERN_NOT_SUPPORTED), and the private
+		// THREAD_POLICY_STATE flavor is refused with KERN_PROTECTION_FAILURE for an ordinary caller.
+		// Not documented. Evidence: black-box observation on macOS 27, arm64 and x86_64 under
+		// Rosetta (tier 2).
+		// Test: tests/src/thread_policy_get.c (main tree), "AFFINITY" and "POLICY_STATE".
+		case THREAD_AFFINITY_POLICY:
+			return KERN_NOT_SUPPORTED;
+		case THREAD_POLICY_STATE:
+			return KERN_PROTECTION_FAILURE;
+
+		// THREAD_BACKGROUND_POLICY and THREAD_QOS_POLICY_OVERRIDE can be set but not read
 		default:
 			return KERN_INVALID_ARGUMENT;
 	}
-
-	*get_default = TRUE;
-	return KERN_SUCCESS;
 };
 
 kern_return_t thread_policy_set(thread_t thread, thread_policy_flavor_t flavor, thread_policy_t policy_info, mach_msg_type_number_t count) {

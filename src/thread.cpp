@@ -46,9 +46,39 @@
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#if defined(__ANDROID__) || defined(__BIONIC__)
+extern "C" {
+int darling_libucontext_getcontext(ucontext_t*) __asm__("libucontext_getcontext");
+int darling_libucontext_setcontext(const ucontext_t*) __asm__("libucontext_setcontext");
+int darling_libucontext_swapcontext(ucontext_t*, const ucontext_t*) __asm__("libucontext_swapcontext");
+void darling_libucontext_makecontext(ucontext_t*, void (*)(), int, ...) __asm__("libucontext_makecontext");
+}
+#define getcontext(u) darling_libucontext_getcontext(u)
+#if defined(__aarch64__)
+static inline void darling_dserver_makecontext_arm64(ucontext_t* ucp, void (*func)(), ...) {
+	uintptr_t* sp = (uintptr_t*)((uintptr_t)ucp->uc_stack.ss_sp + ucp->uc_stack.ss_size);
+	sp = (uintptr_t*)((uintptr_t)sp & -16L);
+	ucp->uc_mcontext.sp = (uintptr_t)sp;
+	ucp->uc_mcontext.pc = (uintptr_t)func;
+	ucp->uc_mcontext.regs[0] = 0;
+	ucp->uc_mcontext.regs[19] = (uintptr_t)ucp->uc_link;
+	ucp->uc_mcontext.regs[29] = 0;
+	ucp->uc_mcontext.regs[30] = 0;
+}
+#define makecontext(u, fn, ...) darling_dserver_makecontext_arm64(u, (void(*)())fn, __VA_ARGS__)
+#else
+#define makecontext(u, fn, ...) darling_libucontext_makecontext(u, (void(*)())fn, __VA_ARGS__)
+#endif
+#define setcontext(u) darling_libucontext_setcontext(u)
+#define swapcontext(ou, nu) darling_libucontext_swapcontext(ou, nu)
+#endif
 #include <vector>
 #include <utility> // x86Sim
 #include <atomic> // x86Sim
+#if defined(__aarch64__)
+#include <sys/uio.h>
+#include <elf.h>
+#endif
 
 // 64KiB should be enough for us
 // x86Sim: microthread context switches without glibc's rt_sigprocmask per getcontext()/setcontext() (src/fastcontext.cpp)
@@ -88,6 +118,87 @@ static thread_local uint64_t interruptDisableCount = 0;
 static DarlingServer::Log threadLog("thread");
 
 DarlingServer::StackPool DarlingServer::Thread::stackPool(IDLE_THREAD_STACK_COUNT, THREAD_STACK_SIZE, USE_THREAD_GUARD_PAGES);
+
+// Finds which of the given threads (all in the same process) owns the stack containing `stackHint`:
+// the one whose stack pointer is nearest below it. Each thread is briefly ptrace-attached to read
+// its registers and is always detached again. Returns -1 if no thread matches.
+//
+// If no readable thread matches but exactly one thread's registers could not be read, that thread
+// is returned and `guessed` is set: it is the only thread that can still be the one we want.
+// With two or more unreadable threads there is no way to tell them apart, so none is chosen.
+static pid_t findThreadByStackHint(const std::vector<pid_t>& ids, void* stackHint, bool& guessed) {
+	pid_t chosenId = -1;
+	intptr_t nearest = std::numeric_limits<intptr_t>::max();
+	pid_t unreadableId = -1;
+	size_t unreadableCount = 0;
+
+	guessed = false;
+
+	for (auto id : ids) {
+		if (ptrace(PTRACE_ATTACH, id, 0, 0) == -1) {
+			continue;
+		}
+
+		int status;
+		int waitStatus;
+		do {
+			waitStatus = waitpid(id, &status, 0);
+		} while (waitStatus == -1 && errno == EINTR);
+
+		if (waitStatus < 0) {
+			continue;
+		}
+
+		// the thread exited before it stopped; it is gone and no longer traced
+		if (WIFEXITED(status) || WIFSIGNALED(status)) {
+			continue;
+		}
+
+		uintptr_t stackPointer = 0;
+		bool gotStackPointer = false;
+#ifdef __x86_64__
+		struct user_regs_struct regs;
+		if (ptrace(PTRACE_GETREGS, id, 0, &regs) != -1) {
+			stackPointer = regs.rsp;
+			gotStackPointer = true;
+		}
+#elif defined(__aarch64__)
+		struct user_regs_struct regs;
+		struct iovec iov = { &regs, sizeof(regs) };
+		if (ptrace(PTRACE_GETREGSET, id, (void*)NT_PRSTATUS, &iov) != -1) {
+			stackPointer = regs.sp;
+			gotStackPointer = true;
+		}
+#else
+	#error Unsupported architecture
+#endif
+
+		if (gotStackPointer) {
+			intptr_t stackDiff = (intptr_t)stackHint - (intptr_t)stackPointer;
+			if (stackDiff >= 0 && stackDiff < nearest) {
+				chosenId = id;
+				nearest = stackDiff;
+			}
+		}
+		else {
+			// e.g. a thread that has not reached its ptrace stop yet; it is still detached below
+			unreadableId = id;
+			++unreadableCount;
+		}
+
+		// this is critical: we're tracing a process but cannot detach from it, and it'll not run normally.
+		if (ptrace(PTRACE_DETACH, id, 0, 0) == -1) {
+			throw std::system_error(errno, std::generic_category(), "Failed to detach from process.");
+		}
+	}
+
+	if (chosenId == -1 && unreadableCount == 1) {
+		chosenId = unreadableId;
+		guessed = true;
+	}
+
+	return chosenId;
+};
 
 DarlingServer::Thread::Thread(std::shared_ptr<Process> process, NSID nsid, void* stackHint):
 	_nstid(nsid),
@@ -140,44 +251,11 @@ DarlingServer::Thread::Thread(std::shared_ptr<Process> process, NSID nsid, void*
 		if (ids.size() == 1) {
 			_tid = ids[0];
 		} else if (stackHint != nullptr) {
-			pid_t chosenId = -1;
-			intptr_t nearest = std::numeric_limits<intptr_t>::max();
-
-			for (auto id : ids) {
-				if (ptrace(PTRACE_ATTACH, id, 0, 0) == -1) {
-					continue;
-				}
-
-				int status;
-				int waitStatus = waitpid(id, &status, 0);
-
-				if (waitStatus < 0) {
-					continue;
-				}
-
-				struct user_regs_struct regs;
-				if (ptrace(PTRACE_GETREGS, id, 0, &regs) == -1) {
-					continue;
-				}
-
-#ifdef __x86_64__
-				intptr_t stackDiff = (intptr_t)stackHint - (intptr_t)regs.rsp;
-				if (stackDiff >= 0 && stackDiff < nearest) {
-#else
-	#warning Unsupported architecture
-				if (true) {
-#endif
-					chosenId = id;
-					nearest = stackDiff;
-				}
-
-				// this is critical: we're tracing a process but cannot detach from it, and it'll not run normally.
-				if (ptrace(PTRACE_DETACH, id, 0, 0) == -1) {
-					throw std::system_error(errno, std::generic_category(), "Failed to detach from process.");
-				}
+			bool guessed;
+			_tid = findThreadByStackHint(ids, stackHint, guessed);
+			if (guessed) {
+				threadLog.debug() << "Stack hint matched no readable thread; using thread " << _tid << ", the only one whose registers could not be read" << threadLog.endLog;
 			}
-
-			_tid = chosenId;
 		}
 	}
 
@@ -324,8 +402,88 @@ void DarlingServer::Thread::setAddress(Address address) {
 	_address = address;
 };
 
-void DarlingServer::Thread::setThreadHandles(uintptr_t pthreadHandle, uintptr_t dispatchQueueAddress) {
+void DarlingServer::Thread::setThreadHandles(uintptr_t pthreadHandle, uintptr_t dispatchQueueAddress, uintptr_t cancelMarkedAddress) {
 	dtape_thread_set_handles(_dtapeThread, pthreadHandle, dispatchQueueAddress);
+
+	std::unique_lock lock(_rwlock);
+	_cancelMarkedAddress = cancelMarkedAddress;
+};
+
+int DarlingServer::Thread::pthreadCanceled(int action) {
+	return -dtape_thread_pthread_canceled(_dtapeThread, action);
+};
+
+bool DarlingServer::Thread::pthreadTestcancel() {
+	return dtape_thread_pthread_testcancel(_dtapeThread);
+};
+
+void DarlingServer::Thread::pthreadMarkcancel(bool interruptUser) {
+	dtape_thread_t* dtapeThread = nullptr;
+	bool interrupt = false;
+
+	{
+		std::shared_lock lock(_rwlock);
+		if (_dead || !_dtapeThread) {
+			return;
+		}
+		// the duct-taped thread is released asynchronously once we're dead,
+		// so keep it alive while we use it outside the lock
+		dtapeThread = _dtapeThread;
+		dtape_thread_retain(dtapeThread);
+	}
+
+	bool marked = dtape_thread_pthread_markcancel(dtapeThread, &interrupt);
+	dtape_thread_release(dtapeThread);
+
+	if (!marked) {
+		return;
+	}
+
+	bool waiting = false;
+
+	{
+		// a thread checks out (which marks it dead) before it unmaps its stack, and with it its TSD.
+		// holding the lock across the accesses keeps it from dying in between, so we never touch freed memory.
+		std::shared_lock lock(_rwlock);
+		if (_dead) {
+			return;
+		}
+		uintptr_t address = _cancelMarkedAddress;
+		auto proc = process();
+
+		// the TSD slot is pointer-sized (4 bytes for i386 processes, 8 bytes otherwise), and the thread zeroes it
+		// when it registers it. its first byte is ours: setting it to 1 lets the thread know that it has to ask us
+		// at cancellation points (the slot then reads as nonzero in either width). its second byte belongs to
+		// the thread, which sets it while it waits at a cancellation point in user space (e.g. in a ulock wait).
+		if (address != 0) {
+			uint8_t flag = 1;
+			if (!proc || !proc->writeMemory(address, &flag, sizeof(flag))) {
+				threadLog.warning() << *this << ": failed to set the cancel flag" << threadLog.endLog;
+			} else if (interrupt && interruptUser) {
+				// the thread sets its byte before it checks ours, and we check its byte after we set ours,
+				// so either it sees our flag before it waits, or we see that it waits (or both)
+				std::atomic_thread_fence(std::memory_order_seq_cst);
+
+				uint8_t threadWaiting = 0;
+				if (proc->readMemory(address + 1, &threadWaiting, sizeof(threadWaiting))) {
+					waiting = threadWaiting != 0;
+				}
+			}
+		}
+	}
+
+	// in xnu, a ulock wait is an abort-safe kernel wait that thread_abort_safely() ends with EINTR.
+	// here, it is a futex wait in the thread itself, out of reach of the duct-taped thread_abort_safely().
+	// interrupt it with the signal that thread_hold() uses: with no suspension pending, its handler only tells us
+	// about the interruption, and libsystem_kernel makes the cancelable wait return EINTR.
+	if (waiting) {
+		try {
+			sendSignal(LINUX_SIGRTMIN);
+		} catch (const std::system_error& e) {
+			// the thread has exited in the meantime
+			threadLog.debug() << *this << ": failed to interrupt the thread for cancellation: " << e.code() << threadLog.endLog;
+		}
+	}
 };
 
 bool DarlingServer::Thread::waitingForReply() const {
@@ -1552,6 +1710,14 @@ void DarlingServer::Thread::logToStream(Log::Stream& stream) const {
 };
 
 void DarlingServer::Thread::pushCallReply(std::shared_ptr<Call> expectedCall, Message&& reply) {
+	// the call is done, so the thread is about to return to user space.
+	// this must happen before the reply is sent (or the thread could be marked again in user space before we clear the abort)
+	// and without `_rwlock` held (the thread lock is taken before `_rwlock` elsewhere).
+	// the duct-taped thread cannot be released while the call is still active.
+	if (expectedCall && _dtapeThread) {
+		dtape_thread_returning_to_user(_dtapeThread);
+	}
+
 	std::unique_lock lock(_rwlock);
 
 	if (expectedCall) {
@@ -1670,6 +1836,9 @@ void DarlingServer::Thread::notifyDead() {
 
 		threadLog.info() << *this << ": thread dying" << threadLog.endLog;
 		_dead = true;
+
+		// the thread's TSD may be unmapped from now on
+		_cancelMarkedAddress = 0;
 
 		if (!_activeCall) {
 			// if we have no active call, we won't ever need to run again,

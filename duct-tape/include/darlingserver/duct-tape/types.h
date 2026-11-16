@@ -27,6 +27,12 @@ typedef enum dtape_semaphore_wait_result {
 	dtape_semaphore_wait_result_interrupted = 1,
 } dtape_semaphore_wait_result_t;
 
+typedef enum dtape_fileport_result {
+	dtape_fileport_result_ok = 0,
+	dtape_fileport_result_invalid_port = 1,
+	dtape_fileport_result_no_resources = 2,
+} dtape_fileport_result_t;
+
 typedef void (*dtape_thread_continuation_callback_f)(void* context);
 
 typedef struct dtape_memory_info {
@@ -36,6 +42,12 @@ typedef struct dtape_memory_info {
 	uint64_t region_count;
 	uint64_t user_time_us;   // x86Sim: CPU time used (task_info basic / thread times)
 	uint64_t system_time_us;
+	uint64_t resident_size_peak;
+	uint64_t internal_size;
+	uint64_t external_size;
+	uint64_t swapped_size;
+	uint64_t phys_footprint;
+	uint64_t phys_footprint_peak;
 } dtape_memory_info_t;
 
 typedef enum dtape_memory_protection {

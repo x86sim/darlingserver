@@ -21,6 +21,9 @@ typedef struct dtape_thread_user_state {
 #if __x86_64__
 	x86_thread_state_t thread_state;
 	x86_float_state_t float_state;
+#elif __aarch64__
+	arm_unified_thread_state_t thread_state;
+	arm_neon_state64_t float_state;
 #endif
 } dtape_thread_user_state_t;
 
@@ -56,6 +59,7 @@ struct dtape_thread {
 	caddr_t uu_wchan;
 	int (*uu_continuation)(int);
 	const char* uu_wmesg;
+	int uu_flag;
 
 	struct thread xnu_thread;
 };

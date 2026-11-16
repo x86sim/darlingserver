@@ -3819,17 +3819,12 @@ ipc_kmsg_copyin_body(
 				goto clean_message;
 			}
 
-#ifdef __DARLING__
-			// msg_ool_size_small is 0 here (no kalloc zones), so a
-			// zero-length descriptor would reach the overflow check below
-			// with round_page(0) == 0 and fail with MACH_MSG_VM_KERNEL.
-			// Copyin maps zero-length descriptors to NULL without
-			// allocating anything, so they need no kernel space.
-			if (size != 0 &&
-			    (size >= MSG_OOL_SIZE_SMALL) &&
-#else
-			if ((size >= MSG_OOL_SIZE_SMALL) &&
-#endif
+			/*
+			 * Darling's small-copy threshold is zero. An empty region
+			 * needs no kernel memory (ipc_kmsg_copyin_ool_descriptor
+			 * sends it as NULL) and must not trip the overflow check.
+			 */
+			if (size != 0 && (size >= MSG_OOL_SIZE_SMALL) &&
 			    (daddr->out_of_line.copy == MACH_MSG_PHYSICAL_COPY) &&
 			    !(daddr->out_of_line.deallocate)) {
 				/*

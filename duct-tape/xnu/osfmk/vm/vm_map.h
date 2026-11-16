@@ -209,6 +209,14 @@ struct vm_named_entry {
 #define NAMED_ENTRY_BT_DEPTH 16
 	void                    *named_entry_bt[NAMED_ENTRY_BT_DEPTH];
 #endif /* VM_NAMED_ENTRY_LIST */
+#ifdef __DARLING__
+	/*
+	 * The memfd-backed object of an entry made by _mach_make_memory_entry()
+	 * (a dtape_map_shared_descriptor_t, see duct-tape/src/memory.c), or NULL.
+	 * `offset` is the byte offset of the entry in it.
+	 */
+	void                    *dtape_descriptor;
+#endif // __DARLING__
 };
 
 /*
@@ -1570,12 +1578,12 @@ static inline bool
 VM_MAP_IS_EXOTIC(
 	vm_map_t map __unused)
 {
-#if __arm64__
+#if __arm64__ && !defined(__DARLING__)
 	if (VM_MAP_PAGE_SHIFT(map) < PAGE_SHIFT ||
 	    pmap_is_exotic(map->pmap)) {
 		return true;
 	}
-#endif /* __arm64__ */
+#endif /* __arm64__ && !__DARLING__ */
 	return false;
 }
 

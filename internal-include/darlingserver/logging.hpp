@@ -31,10 +31,7 @@ namespace DarlingServer {
 	class Process;
 
 	class Log {
-	private:
-		std::string _category;
-		bool _alwaysLog = false;
-
+	public:
 		enum class Type {
 			Debug = 1,
 			Info = 2,
@@ -42,9 +39,11 @@ namespace DarlingServer {
 			Error = 4,
 		};
 
+	private:
+		std::string _category;
+		bool _alwaysLog = false;
+
 		void _log(Type type, std::string message) const;
-		// x86Sim: whether a message of this type would be written (a disabled Stream formats nothing)
-		bool _wants(Type type) const;
 		static std::string _typeToString(Type type);
 
 	public:
@@ -59,6 +58,12 @@ namespace DarlingServer {
 
 		class Stream;
 		friend class Stream;
+
+		/**
+		 * Returns whether a message of the given type would be written.
+		 * Callers can use this to skip expensive formatting for messages that would be dropped.
+		 */
+		bool enabled(Type type) const;
 
 		Stream debug() const;
 		Stream info() const;
@@ -77,9 +82,7 @@ namespace DarlingServer {
 	private:
 		Type _type;
 		const Log& _log;
-		// x86Sim: made only for a type the log writes; debug()/info() streams on hot paths (every call, every
-		// Mach message) built and threw away a formatted string each time (~8% of darlingserver while scrolling)
-		std::optional<std::ostringstream> _buffer;
+		std::unique_ptr<std::ostringstream> _buffer; // null if this stream's messages are dropped
 
 		Stream(Type type, const Log& log);
 

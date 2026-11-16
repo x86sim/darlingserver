@@ -27,24 +27,40 @@
 #include <system_error>
 #include <darlingserver/logging.hpp>
 #include <cstring>
+#include <optional>
+#include <pthread.h>
 
 static DarlingServer::Log messageLog("message");
 
-#include <algorithm> // x86Sim
-#include <cstring> // x86Sim
+// set by Message::initializeServerCredentials(); written once before any other thread exists
+static std::optional<struct ucred> cachedCredentials;
 
-// x86Sim (willi/darlingserver#15): the credentials a Message sends with (SCM_CREDENTIALS), read once: three syscalls
-// for every Message. They don't change once the first Message exists: main() drops privileges for good before it
-// creates the Server, and darlingserver never forks a process that makes Messages (its one clone() runs launchd).
-static const struct ucred& ourCredentials() {
-	static const struct ucred credentials = [] {
-		struct ucred creds;
-		creds.pid = getpid();
-		creds.uid = getuid();
-		creds.gid = getgid();
-		return creds;
-	}();
-	return credentials;
+static struct ucred outgoingCredentials() {
+	if (cachedCredentials) {
+		return *cachedCredentials;
+	}
+
+	struct ucred creds;
+	creds.pid = getpid();
+	creds.uid = getuid();
+	creds.gid = getgid();
+	return creds;
+};
+
+void DarlingServer::Message::initializeServerCredentials() {
+	if (cachedCredentials) {
+		throw std::logic_error("Server credentials already initialized");
+	}
+
+	// a forked child has a different PID and must not send the parent's
+	int result = pthread_atfork(nullptr, nullptr, []() {
+		cachedCredentials.reset();
+	});
+	if (result != 0) {
+		throw std::system_error(result, std::generic_category(), "Failed to register fork handler for the server credentials");
+	}
+
+	cachedCredentials = outgoingCredentials();
 };
 
 DarlingServer::Address::Address() {
@@ -77,6 +93,9 @@ void DarlingServer::Address::setRawSize(size_t newRawSize) {
 DarlingServer::Message::Message(size_t bufferSpace, size_t descriptorSpace, std::function<void()> sendNotificationCallback):
 	_sendNotificationCallback(sendNotificationCallback)
 {
+	// allocate the data buffer first: if that throws, the destructor does not run and would not free the control buffer
+	_buffer.resize(bufferSpace);
+
 	size_t controlLen = CMSG_SPACE(sizeof(struct ucred)) + (descriptorSpace > 0 ? CMSG_SPACE(sizeof(int) * descriptorSpace) : 0);
 	_controlHeader = static_cast<decltype(_controlHeader)>(malloc(controlLen));
 
@@ -87,6 +106,7 @@ DarlingServer::Message::Message(size_t bufferSpace, size_t descriptorSpace, std:
 	_controlHeader->cmsg_len = CMSG_LEN(sizeof(struct ucred));
 	_controlHeader->cmsg_level = SOL_SOCKET;
 	_controlHeader->cmsg_type = SCM_CREDENTIALS;
+	struct ucred ourCreds = outgoingCredentials();
 	// the cmsg man page says memcpy should be used with CMSG_DATA instead of direct pointer access
 	memcpy(CMSG_DATA(_controlHeader), &ourCredentials(), sizeof(struct ucred));
 
@@ -100,8 +120,6 @@ DarlingServer::Message::Message(size_t bufferSpace, size_t descriptorSpace, std:
 			memcpy(CMSG_DATA(fdHeader) + (sizeof(int) * i), &fd, sizeof(int));
 		}
 	}
-
-	_buffer.resize(bufferSpace);
 
 	_header.msg_name = &_socketAddress.raw();
 	_header.msg_namelen = _socketAddress.rawSize();
@@ -366,7 +384,8 @@ void DarlingServer::Message::_ensureCredentialsHeader() {
 	credHeader->cmsg_level = SOL_SOCKET;
 	credHeader->cmsg_type = SCM_CREDENTIALS;
 
-	memcpy(CMSG_DATA(credHeader), &ourCredentials(), sizeof(struct ucred));
+	struct ucred creds = outgoingCredentials();
+	memcpy(CMSG_DATA(credHeader), &creds, sizeof(struct ucred));
 };
 
 void DarlingServer::Message::_ensureDescriptorHeader(size_t newSpace) {
@@ -496,6 +515,42 @@ void DarlingServer::MessageQueue::push(Message&& message) {
 		if (callback) {
 			callback();
 		}
+	}
+};
+
+void DarlingServer::MessageQueue::_notifyIfNotEmpty() {
+	std::unique_lock lock(_lock);
+
+	if (_messages.empty()) {
+		return;
+	}
+
+	auto callback = _messageArrivalNotificationCallback;
+	lock.unlock();
+	if (callback) {
+		callback();
+	}
+};
+
+void DarlingServer::MessageQueue::pushAndSend(Message&& message, int socket) {
+	{
+		std::scoped_lock lock(_lock);
+		_messages.push_back(std::move(message));
+	}
+
+	bool canSendMore;
+
+	try {
+		canSendMore = sendMany(socket);
+	} catch (...) {
+		// the messages are still queued; let the owner retry (and see the error) on its side
+		_notifyIfNotEmpty();
+		throw;
+	}
+
+	if (!canSendMore) {
+		// the socket is full; the owner has to send the rest once it is writable again
+		_notifyIfNotEmpty();
 	}
 };
 

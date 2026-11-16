@@ -10,8 +10,9 @@ DarlingServer::Log::Stream DarlingServer::Log::info() const { return Stream(Type
 DarlingServer::Log::Stream DarlingServer::Log::warning() const { return Stream(Type::Warning, *this); }
 DarlingServer::Log::Stream DarlingServer::Log::error() const { return Stream(Type::Error, *this); }
 
-// x86Sim: Stream's buffer is optional (made only for a category that logs); always made here
-DarlingServer::Log::Stream::Stream(Type type, const Log& log): _type(type), _log(log) { _buffer.emplace(); }
+bool DarlingServer::Log::enabled(Type) const { return true; }
+
+DarlingServer::Log::Stream::Stream(Type type, const Log& log): _type(type), _log(log), _buffer(std::make_unique<std::ostringstream>()) {}
 DarlingServer::Log::Stream::~Stream() {}
 DarlingServer::Log::Stream& DarlingServer::Log::Stream::operator<<(EndLog) {
 	std::fprintf(stderr, "  log[%s]: %s\n", _log._category.c_str(), _buffer->str().c_str());

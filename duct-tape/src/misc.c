@@ -12,6 +12,10 @@
 
 #include <sys/types.h>
 
+#if __aarch64__ || __arm64__
+#include <mach/arm/thread_status.h>
+#endif
+
 char version[] = "Darling 11.5";
 
 #if __x86_64__ || __i386__
@@ -39,15 +43,55 @@ char version[] = "Darling 11.5";
 		[x86_PAGEIN_STATE]              = x86_PAGEIN_STATE_COUNT
 	};
 	// </copied>
+#elif __aarch64__
+	unsigned int _MachineStateCount[] = {
+		[ARM_THREAD_STATE]              = ARM_THREAD_STATE_COUNT,
+		[ARM_VFP_STATE]                 = ARM_VFP_STATE_COUNT,
+		[ARM_EXCEPTION_STATE]           = ARM_EXCEPTION_STATE_COUNT,
+		[ARM_DEBUG_STATE]               = ARM_DEBUG_STATE_COUNT,
+		[ARM_THREAD_STATE64]            = ARM_THREAD_STATE64_COUNT,
+		[ARM_EXCEPTION_STATE64]         = ARM_EXCEPTION_STATE64_COUNT,
+		[ARM_THREAD_STATE32]            = ARM_THREAD_STATE32_COUNT,
+		[ARM_DEBUG_STATE32]             = ARM_DEBUG_STATE32_COUNT,
+		[ARM_DEBUG_STATE64]             = ARM_DEBUG_STATE64_COUNT,
+		[ARM_NEON_STATE]                = ARM_NEON_STATE_COUNT,
+		[ARM_NEON_STATE64]              = ARM_NEON_STATE64_COUNT,
+		[ARM_CPMU_STATE64]              = 0,
+	};
 #else
 	#error _MachineStateCount not defined on this architecture
 #endif
 
 int vsnprintf(char* buffer, size_t buffer_size, const char* format, va_list args);
+#if defined(__ANDROID__)
+#include <sys/syscall.h>
+#ifndef SYS_getrandom
+#if defined(__aarch64__)
+#define SYS_getrandom 278
+#elif defined(__x86_64__)
+#define SYS_getrandom 318
+#elif defined(__arm__)
+#define SYS_getrandom 384
+#elif defined(__i386__)
+#define SYS_getrandom 355
+#endif
+#endif
+extern long syscall(long number, ...);
+static inline ssize_t darling_getrandom(void* buf, size_t buflen, unsigned int flags) {
+	return (ssize_t)syscall(SYS_getrandom, buf, buflen, flags);
+}
+#define getrandom darling_getrandom
+#else
 ssize_t getrandom(void* buf, size_t buflen, unsigned int flags);
+#endif
 
 
 void dtape_logv(dtape_log_level_t level, const char* format, va_list args) {
+	// don't format messages that would be dropped anyway
+	if (dtape_hooks->log_enabled && !dtape_hooks->log_enabled(level)) {
+		return;
+	}
+
 	char message[4096];
 	vsnprintf(message, sizeof(message), format, args);
 	dtape_hooks->log(level, message);
@@ -124,4 +168,71 @@ fls(unsigned int mask)
 // </copied>
 //
 
+#endif /* __x86_64__ */
+
+#if __aarch64__ || __arm64__
+
+// ARM64-specific stubs and definitions
+
+#include <kern/simple_lock.h>
+
+// PAGE_SHIFT_CONST is extern on ARM64 (variable page size support in XNU).
+// It is duct-tape's own allocation granularity, not the page size guests see: that comes
+// from the commpage, which mldr fills in from the host and which is 16K on some of them.
+// The VMAPPLE board configuration (__ARM_16K_PG__) gives every other translation unit a
+// compile-time PAGE_SHIFT of ARM_PGSHIFT; the few that read this variable must agree with
+// them, whatever the host's page size.
+#if !__ARM_16K_PG__
+#error "duct-tape expects the 16K page configuration of the VMAPPLE board"
 #endif
+int PAGE_SHIFT_CONST = ARM_PGSHIFT;
+
+// ARM simple lock init (normally in arm/locks_arm.c).
+// The arm/simple_lock.h macro `simple_lock_init(l, t)` maps to this;
+// delegate to Darling's usimple_lock_init which properly initializes
+// the embedded lck_spin_t (see src/locks.c).
+extern void usimple_lock_init(usimple_lock_t lock, unsigned short tag);
+void arm_usimple_lock_init(simple_lock_t l, unsigned short type) {
+	usimple_lock_init((usimple_lock_t)l, type);
+}
+
+// Thread task accessor (normally in kern/bsd_kern.c)
+task_t get_threadtask(thread_t th) {
+	return th->task;
+}
+
+// Preemption stubs (normally in arm/machine_routines.c)
+void _disable_preemption(void) {
+	// no-op in Darling
+}
+
+void _enable_preemption(void) {
+	// no-op in Darling
+}
+
+int get_preemption_level(void) {
+	return 0;
+}
+
+// Thread group stubs (normally in arm/machine_routines_common.c).
+// arm/proc_reg.h sets CONFIG_THREAD_GROUPS=1 on ARM64, so ipc_port_thread_group_*
+// in ipc_port.c will reference these. Darling doesn't implement thread groups.
+void machine_thread_group_blocked(void *tg_blocked, void *tg_blocking, uint32_t flags, thread_t blocked_thread) {
+	// no-op in Darling
+}
+
+void machine_thread_group_unblocked(void *tg_unblocked, void *tg_unblocking, uint32_t flags, thread_t unblocked_thread) {
+	// no-op in Darling
+}
+
+// fls for ARM64
+int
+fls(unsigned int mask)
+{
+	if (mask == 0) {
+		return 0;
+	}
+	return (sizeof(mask) << 3) - __builtin_clz(mask);
+}
+
+#endif /* __aarch64__ || __arm64__ */

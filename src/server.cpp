@@ -39,8 +39,12 @@
 #include <sys/wait.h>
 
 #include <darlingserver/logging.hpp>
+#include <darlingserver/code-signing.hpp>
+#include <darlingserver/system-config.hpp>
 
 static DarlingServer::Server* sharedInstancePointer = nullptr;
+static DarlingServer::Log serverLog("server");
+static DarlingServer::Log codeSigningLog("codesign");
 
 struct DTapeHooks {
 	static void dtape_hook_thread_suspend(void* thread_context, dtape_thread_continuation_callback_f continuationCallback, void* continuationContext, libsimple_lock_t* unlockMe) {
@@ -118,8 +122,27 @@ struct DTapeHooks {
 		}
 	};
 
+	static DarlingServer::Log& dtapeLog() {
+		static DarlingServer::Log log("dtape");
+		return log;
+	};
+
+	static bool dtape_hook_log_enabled(dtape_log_level_t level) {
+		switch (level) {
+			case dtape_log_level_debug:
+				return dtapeLog().enabled(DarlingServer::Log::Type::Debug);
+			case dtape_log_level_info:
+				return dtapeLog().enabled(DarlingServer::Log::Type::Info);
+			case dtape_log_level_warning:
+				return dtapeLog().enabled(DarlingServer::Log::Type::Warning);
+			case dtape_log_level_error:
+			default:
+				return dtapeLog().enabled(DarlingServer::Log::Type::Error);
+		}
+	};
+
 	static void dtape_hook_log(dtape_log_level_t level, const char* message) {
-		static const auto log = DarlingServer::Log("dtape");
+		const auto& log = dtapeLog();
 		auto process = DarlingServer::Process::currentProcess();
 		auto thread = DarlingServer::Thread::currentThread();
 		pid_t pid = process ? process->id() : -1;
@@ -291,6 +314,12 @@ struct DTapeHooks {
 		memory_info->region_count = info.regionCount;
 		memory_info->user_time_us = info.userTimeUs;
 		memory_info->system_time_us = info.systemTimeUs;
+		memory_info->resident_size_peak = info.residentSizePeak;
+		memory_info->internal_size = info.internalSize;
+		memory_info->external_size = info.externalSize;
+		memory_info->swapped_size = info.swappedSize;
+		memory_info->phys_footprint = info.physFootprint;
+		memory_info->phys_footprint_peak = info.physFootprintPeak;
 		return true;
 	};
 
@@ -381,6 +410,42 @@ struct DTapeHooks {
 		return static_cast<DarlingServer::Process*>(task_context)->eternalID();
 	};
 
+	static bool dtape_hook_task_port_allowed(void* caller_task_context, void* target_task_context, dtape_task_port_flavor_t flavor) {
+		using namespace DarlingServer::CodeSigning;
+
+		auto caller = static_cast<DarlingServer::Process*>(caller_task_context);
+		auto target = static_cast<DarlingServer::Process*>(target_task_context);
+
+		if (!caller || !target) {
+			return true;
+		}
+
+		PortFlavor portFlavor = PortFlavor::Control;
+		switch (flavor) {
+			case dtape_task_port_flavor_name:    portFlavor = PortFlavor::Name; break;
+			case dtape_task_port_flavor_inspect: portFlavor = PortFlavor::Inspect; break;
+			case dtape_task_port_flavor_read:    portFlavor = PortFlavor::Read; break;
+			case dtape_task_port_flavor_control: portFlavor = PortFlavor::Control; break;
+		}
+
+		auto state = target->codeSigningState();
+		if (state.code_signing_policy == dserver_code_signing_policy_off) {
+			return true;
+		}
+
+		bool isSelf = (caller == target);
+		auto csr = DarlingServer::SystemConfig::sharedInstance().current().csr_active_config;
+		auto verdict = applyPolicy(state.code_signing_policy, taskPortRule(isSelf, isSelf ? 0 : caller->guestUID(), isSelf ? 0 : target->guestUID(), state, portFlavor, csr));
+
+		if (verdict == Verdict::Denied) {
+			codeSigningLog.warning() << "task_for_pid (flavor " << static_cast<int>(flavor) << ") by " << *caller << " for " << *target << " denied" << codeSigningLog.endLog;
+		} else if (verdict == Verdict::WouldDeny) {
+			codeSigningLog.info() << "task_for_pid (flavor " << static_cast<int>(flavor) << ") by " << *caller << " for " << *target << " would be denied under enforcement" << codeSigningLog.endLog;
+		}
+
+		return verdict != Verdict::Denied;
+	};
+
 #if DSERVER_EXTENDED_DEBUG
 	static void dtape_hook_task_register_name(void* task_context, uint32_t name, uintptr_t pointer) {
 		static_cast<DarlingServer::Process*>(task_context)->_registerName(name, pointer);
@@ -410,6 +475,7 @@ struct DTapeHooks {
 		.timer_arm = dtape_hook_timer_arm,
 
 		.log = dtape_hook_log,
+		.log_enabled = dtape_hook_log_enabled,
 		.get_load_info = dtape_hook_get_load_info,
 
 		.thread_suspend = dtape_hook_thread_suspend,
@@ -445,6 +511,7 @@ struct DTapeHooks {
 		.task_sync_memory = dtape_hook_task_sync_memory,
 		.task_context_dispose = dtape_hook_task_context_dispose,
 		.task_eternal_id = dtape_hook_task_eternal_id,
+		.task_port_allowed = dtape_hook_task_port_allowed,
 
 #if DSERVER_EXTENDED_DEBUG
 		.task_register_name = dtape_hook_task_register_name,
@@ -455,6 +522,9 @@ struct DTapeHooks {
 #endif
 	};
 };
+
+// set while the main loop runs a call inline; the loop flushes the outbox itself right afterwards, so no eventfd wakeup is needed
+static thread_local bool runningInline = false;
 
 DarlingServer::Server::Server(std::string prefix):
 	_prefix(prefix),
@@ -527,6 +597,9 @@ DarlingServer::Server::Server(std::string prefix):
 		// if it does, that means the main loop has been waiting a LONG time for the listener socket to become writable again.
 		// in that case, we don't really care if the eventfd is being incremented; we can't send anything anyways.
 		// once the socket becomes writable again, the eventfd will be monitored again.
+		if (runningInline) {
+			return;
+		}
 		eventfd_write(_wakeupFD, 1);
 	});
 
@@ -567,14 +640,12 @@ void DarlingServer::Server::start() {
 
 			while (auto msg = _inbox.pop()) {
 				// TODO: this could be done concurrently
-				// x86Sim: a message darlingserver can't take (a client's protocol error: unknown call number, PID
-				// mismatch, ...) costs that message, not every process (willi/darlingserver#7 does this per error class)
+				auto senderPid = msg->pid();
 				std::shared_ptr<DarlingServer::Call> call;
 				try {
 					call = DarlingServer::Call::callFromMessage(std::move(*msg));
 				} catch (const std::exception& e) {
-					static DarlingServer::Log serverLog("server");
-					serverLog.error() << "Dropped a message darlingserver could not take: " << e.what() << serverLog.endLog;
+					serverLog.warning() << "Dropping message from PID " << senderPid << ": " << e.what() << serverLog.endLog;
 					continue;
 				}
 				if (call) {
@@ -617,6 +688,7 @@ void DarlingServer::Server::start() {
 		}
 
 		struct epoll_event events[16];
+
 		int ret = epoll_wait(_epollFD, events, 16, -1);
 
 		if (ret < 0) {

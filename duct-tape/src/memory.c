@@ -977,15 +977,38 @@ kern_return_t mach_memory_entry_purgable_control(ipc_port_t entry_port, vm_purga
 };
 
 kern_return_t mach_memory_info(host_priv_t host, mach_zone_name_array_t* namesp, mach_msg_type_number_t* namesCntp, mach_zone_info_array_t* infop, mach_msg_type_number_t* infoCntp, mach_memory_info_array_t* memoryInfop, mach_msg_type_number_t* memoryInfoCntp) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// No zone allocator here; XNU answers this way when its zone info is unavailable to the caller.
+	if (host == HOST_NULL) {
+		return KERN_INVALID_HOST;
+	}
+	return KERN_FAILURE;
 };
 
 kern_return_t mach_memory_object_memory_entry(host_t host, boolean_t internal, vm_size_t size, vm_prot_t permission, memory_object_t pager, ipc_port_t* entry_handle) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// There are no pagers (convert_port_to_memory_object() gives none); mach_make_memory_entry_64() makes entries.
+	if (host == HOST_NULL) {
+		return KERN_INVALID_HOST;
+	}
+	if (pager != MEMORY_OBJECT_NULL || !internal) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	dtape_stub_safe("anonymous entry without a map");
+	return KERN_NOT_SUPPORTED;
 };
 
 kern_return_t mach_memory_object_memory_entry_64(host_t host, boolean_t internal, vm_object_offset_t size, vm_prot_t permission, memory_object_t pager, ipc_port_t* entry_handle) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// There are no pagers (convert_port_to_memory_object() gives none); mach_make_memory_entry_64() makes entries.
+	if (host == HOST_NULL) {
+		return KERN_INVALID_HOST;
+	}
+	if (pager != MEMORY_OBJECT_NULL || !internal) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	dtape_stub_safe("anonymous entry without a map");
+	return KERN_NOT_SUPPORTED;
 };
 
 void pmap_require(pmap_t pmap) {
@@ -993,35 +1016,75 @@ void pmap_require(pmap_t pmap) {
 };
 
 kern_return_t vm_allocate_cpm(host_priv_t host_priv, vm_map_t map, vm_address_t* addr, vm_size_t size, int flags) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// XNU builds without VM_CPM answer KERN_FAILURE.
+	return KERN_FAILURE;
 };
 
 kern_return_t vm32_mapped_pages_info(vm_map_t map, page_address_array_t* pages, mach_msg_type_number_t* pages_count) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// XNU without MACH_VM_DEBUG.
+	return KERN_FAILURE;
 };
 
 kern_return_t vm32_region_info(vm_map_t map, vm32_offset_t address, vm_info_region_t* regionp, vm_info_object_array_t* objectsp, mach_msg_type_number_t* objectsCntp) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// XNU without MACH_VM_DEBUG.
+	return KERN_FAILURE;
 };
 
 kern_return_t vm32_region_info_64(vm_map_t map, vm32_offset_t address, vm_info_region_64_t* regionp, vm_info_object_array_t* objectsp, mach_msg_type_number_t* objectsCntp) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// XNU without MACH_VM_DEBUG.
+	return KERN_FAILURE;
 };
 
 memory_object_t convert_port_to_memory_object(mach_port_t port) {
-	dtape_stub_unsafe();
+	// x86Sim: called by the mach_memory_object_memory_entry(_64) MIG routines for their pager argument; was
+	// dtape_stub_unsafe. There are no memory object (pager) ports here.
+	return MEMORY_OBJECT_NULL;
 };
 
 kern_return_t mach_vm_behavior_set(vm_map_t map, mach_vm_offset_t start, mach_vm_size_t size, vm_behavior_t new_behavior) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// The hints are only advice (Linux pages them as it likes); accepted after XNU's argument checks.
+	if (map == VM_MAP_NULL || start + size < start) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	if (size == 0) {
+		return KERN_SUCCESS;
+	}
+	switch (new_behavior) {
+		case VM_BEHAVIOR_DEFAULT: case VM_BEHAVIOR_RANDOM: case VM_BEHAVIOR_SEQUENTIAL: case VM_BEHAVIOR_RSEQNTL:
+		case VM_BEHAVIOR_ZERO_WIRED_PAGES: case VM_BEHAVIOR_WILLNEED: case VM_BEHAVIOR_DONTNEED: case VM_BEHAVIOR_FREE:
+		case VM_BEHAVIOR_REUSABLE: case VM_BEHAVIOR_REUSE: case VM_BEHAVIOR_CAN_REUSE: case VM_BEHAVIOR_PAGEOUT:
+			return KERN_SUCCESS;
+		default:
+			return KERN_INVALID_ARGUMENT;
+	}
 };
 
 kern_return_t mach_vm_inherit(vm_map_t map, mach_vm_offset_t start, mach_vm_size_t size, vm_inherit_t new_inheritance) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// Inheritance is not tracked (a Darling fork is a Linux fork: private mappings are copied, shared ones shared);
+	// the call succeeds after XNU's argument checks.
+	if (map == VM_MAP_NULL || start + size < start || new_inheritance > VM_INHERIT_LAST_VALID) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	return KERN_SUCCESS;
 };
 
 kern_return_t mach_vm_machine_attribute(vm_map_t map, mach_vm_address_t addr, mach_vm_size_t size, vm_machine_attribute_t attribute, vm_machine_attribute_val_t* value) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// x86 keeps caches coherent: XNU's pmap_attribute() on Intel answers KERN_INVALID_ARGUMENT for everything but
+	// MATTR_CACHE, which needs no work.
+	if (map == VM_MAP_NULL || addr + size < addr) {
+		return KERN_INVALID_ADDRESS;
+	}
+	if (attribute == MATTR_CACHE) {
+		return KERN_SUCCESS;
+	}
+	return KERN_INVALID_ARGUMENT;
 };
 
 // x86Sim: make [start, start + size) of `map` a shared mapping of a memfd (or find
@@ -1513,7 +1576,27 @@ kern_return_t mach_vm_msync(vm_map_t map, mach_vm_offset_t address, mach_vm_size
 };
 
 kern_return_t mach_vm_page_info(vm_map_t map, mach_vm_address_t address, vm_page_info_flavor_t flavor, vm_page_info_t info, mach_msg_type_number_t* count) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// Request checks as XNU's vm_map_page_range_info_internal() (after VibeDarling/darlingserver c45659f/91e0041);
+	// the answer matches mach_vm_page_query() here: a resident page with one reference, no object.
+	if (map == VM_MAP_NULL || !count) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	switch (flavor) {
+		case VM_PAGE_INFO_BASIC:
+			// XNU also accepts one int less (the structure was once unpadded)
+			if (*count != VM_PAGE_INFO_BASIC_COUNT && *count != VM_PAGE_INFO_BASIC_COUNT - 1) {
+				return KERN_INVALID_ARGUMENT;
+			}
+			break;
+		default:
+			return KERN_INVALID_ARGUMENT;
+	}
+	vm_page_info_basic_t basic = (vm_page_info_basic_t)info;
+	memset(basic, 0, *count * sizeof(int));
+	basic->disposition = VM_PAGE_QUERY_PAGE_PRESENT;
+	basic->ref_count = 1;
+	return KERN_SUCCESS;
 };
 
 kern_return_t mach_vm_page_query(vm_map_t map, mach_vm_offset_t offset, int* disposition, int* ref_count) {
@@ -1590,7 +1673,36 @@ kern_return_t mach_vm_purgable_control(vm_map_t map, mach_vm_offset_t address, v
 };
 
 kern_return_t mach_vm_read_list(vm_map_t map, mach_vm_read_entry_t data_list, natural_t count) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG (also vm32 read_list); was dtape_stub_unsafe. XNU's own body
+	// (xnu://7195.141.2/osfmk/vm/vm_user.c) on our vm_map_copyin / vm_map_copyout.
+	mach_msg_type_number_t i;
+	kern_return_t error;
+	vm_map_copy_t copy;
+
+	if (map == VM_MAP_NULL || count > VM_MAP_ENTRY_MAX) {
+		return KERN_INVALID_ARGUMENT;
+	}
+
+	error = KERN_SUCCESS;
+	for (i = 0; i < count; i++) {
+		vm_map_address_t map_addr = (vm_map_address_t)(data_list[i].address);
+		vm_map_size_t map_size = (vm_map_size_t)(data_list[i].size);
+
+		if (map_size != 0) {
+			error = vm_map_copyin(map, map_addr, map_size, FALSE, &copy);
+			if (KERN_SUCCESS == error) {
+				error = vm_map_copyout(current_task()->map, &map_addr, copy);
+				if (KERN_SUCCESS == error) {
+					data_list[i].address = map_addr;
+					continue;
+				}
+				vm_map_copy_discard(copy);
+			}
+		}
+		data_list[i].address = (mach_vm_address_t)0;
+		data_list[i].size = (mach_vm_size_t)0;
+	}
+	return error;
 };
 
 // x86Sim: mach_vm_region/mach_vm_region_recurse for all of XNU's flavors (they used to abort the whole server for
@@ -2097,11 +2209,24 @@ kern_return_t mach_vm_remap_new_external(vm_map_t target_map, mach_vm_offset_t* 
 };
 
 kern_return_t mach_vm_wire_external(host_priv_t host_priv, vm_map_t map, mach_vm_offset_t start, mach_vm_size_t size, vm_prot_t access) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// Nothing is paged out of a simulator's processes in a way they could notice, so wiring is accepted (as
+	// vm_map_wire_kernel and vm32__task_wire here) after XNU's checks.
+	if (host_priv == HOST_PRIV_NULL) {
+		return KERN_INVALID_HOST;
+	}
+	if (map == VM_MAP_NULL || (access & ~VM_PROT_ALL) != 0 || start + size < start) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	return KERN_SUCCESS;
 };
 
 kern_return_t mach_zone_force_gc(host_t host) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	if (host == HOST_NULL) {
+		return KERN_INVALID_HOST;
+	}
+	return KERN_SUCCESS;
 };
 
 kern_return_t mach_zone_get_btlog_records(host_priv_t host, mach_zone_name_t name, zone_btrecord_array_t* recsp, mach_msg_type_number_t* recsCntp) {
@@ -2115,23 +2240,40 @@ kern_return_t mach_zone_get_zlog_zones(host_priv_t host, mach_zone_name_array_t*
 };
 
 kern_return_t mach_zone_info(host_priv_t host, mach_zone_name_array_t* namesp, mach_msg_type_number_t* namesCntp, mach_zone_info_array_t* infop, mach_msg_type_number_t* infoCntp) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// No zone allocator to describe.
+	if (host == HOST_NULL) {
+		return KERN_INVALID_HOST;
+	}
+	return KERN_FAILURE;
 };
 
 kern_return_t mach_zone_info_for_largest_zone(host_priv_t host, mach_zone_name_t* namep, mach_zone_info_t* infop) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// No zone allocator to describe.
+	if (host == HOST_NULL) {
+		return KERN_INVALID_HOST;
+	}
+	return KERN_FAILURE;
 };
 
 kern_return_t mach_zone_info_for_zone(host_priv_t host, mach_zone_name_t name, mach_zone_info_t* infop) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// No zone allocator to describe.
+	if (host == HOST_NULL) {
+		return KERN_INVALID_HOST;
+	}
+	return KERN_FAILURE;
 };
 
 kern_return_t vm_map_page_query_internal(vm_map_t target_map, vm_map_offset_t offset, int* disposition, int* ref_count) {
-	dtape_stub_unsafe();
+	// x86Sim: reached from vm32 map_page_query (MIG); was dtape_stub_unsafe. Same answer as mach_vm_page_query().
+	return mach_vm_page_query(target_map, offset, disposition, ref_count);
 };
 
 kern_return_t vm_map_purgable_control(vm_map_t map, vm_map_offset_t address, vm_purgable_t control, int* state) {
-	dtape_stub_unsafe();
+	// x86Sim: reached from vm32 purgable_control (MIG); was dtape_stub_unsafe. Same answer as mach_vm_purgable_control().
+	return mach_vm_purgable_control(map, address, control, state);
 };
 
 kern_return_t vm_map_region(vm_map_t map, vm_map_offset_t* address, vm_map_size_t* size, vm_region_flavor_t flavor, vm_region_info_t info, mach_msg_type_number_t* count, mach_port_t* object_name) {
@@ -2160,7 +2302,12 @@ kern_return_t vm32__task_wire(vm_map_t map, boolean_t must_wire) {
 };
 
 kern_return_t vm32__map_exec_lockdown(vm_map_t map) {
-	dtape_stub_unsafe();
+	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
+	// Nothing to lock down: accepted, as XNU does for a valid map.
+	if (map == VM_MAP_NULL) {
+		return KERN_INVALID_ARGUMENT;
+	}
+	return KERN_SUCCESS;
 };
 
 // <copied from="xnu://7195.141.2/osfmk/vm/vm_user.c">

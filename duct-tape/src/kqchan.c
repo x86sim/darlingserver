@@ -71,17 +71,6 @@ void dtape_kqchan_mach_port_modify(dtape_kqchan_mach_port_t* kqchan, uint64_t re
 	filt_machporttouch(&kqchan->knote, &kev);
 };
 
-// Notifiers load the callback once and skip a NULL one; the context stays, so a notifier that loaded the callback just
-// before this still has a context to pass it. That context must outlive such a notifier: the server's is a weak
-// reference, freed only after dtape_kqchan_mach_port_destroy().
-static void kqchan_notify(dtape_kqchan_mach_port_t* kqchan) {
-	dtape_kqchan_mach_port_notification_callback_f callback = __atomic_load_n(&kqchan->callback, __ATOMIC_ACQUIRE);
-
-	if (callback) {
-		callback(kqchan->context);
-	}
-};
-
 void dtape_kqchan_mach_port_disable_notifications(dtape_kqchan_mach_port_t* kqchan) {
 	// this can race with kqchan_notify() on another worker.
 	// clear the callback first and publish the cleared context with release semantics,

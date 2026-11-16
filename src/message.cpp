@@ -29,6 +29,7 @@
 #include <cstring>
 #include <optional>
 #include <pthread.h>
+#include <algorithm> // x86Sim: std::clamp
 
 static DarlingServer::Log messageLog("message");
 
@@ -108,7 +109,7 @@ DarlingServer::Message::Message(size_t bufferSpace, size_t descriptorSpace, std:
 	_controlHeader->cmsg_type = SCM_CREDENTIALS;
 	struct ucred ourCreds = outgoingCredentials();
 	// the cmsg man page says memcpy should be used with CMSG_DATA instead of direct pointer access
-	memcpy(CMSG_DATA(_controlHeader), &ourCredentials(), sizeof(struct ucred));
+	memcpy(CMSG_DATA(_controlHeader), &ourCreds, sizeof(struct ucred));
 
 	if (descriptorSpace > 0) {
 		auto fdHeader = reinterpret_cast<decltype(_controlHeader)>(reinterpret_cast<char*>(_controlHeader) + CMSG_SPACE(sizeof(struct ucred)));

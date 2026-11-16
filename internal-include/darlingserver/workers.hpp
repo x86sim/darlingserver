@@ -185,6 +185,8 @@ namespace DarlingServer {
 				_workerFunction(std::move(item));
 				++ran;
 			}
+		};
+
 		/**
 		 * Runs the work item on the calling thread if a worker is idle and nothing is queued.
 		 *

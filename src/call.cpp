@@ -110,6 +110,15 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			throw std::invalid_argument("Invalid call number");
 	}
 
+	// Ported from VibeDarling/darlingserver@c178853 (Cristian Magherusan-Stanciu): only the server's own uid may
+	// talk to it (the socket is 0600 too). The uid is the kernel's (SCM_CREDENTIALS; -1 without credentials), checked
+	// before any process or thread is registered and for unmanaged calls as well. Every client runs as the server's
+	// uid: setuid mode drops to the invoking user before the server starts, userns mode is uid 0 on both sides, guest
+	// setuid is emulated (Uidgid RPC) and never changes the Linux uid.
+	if (requestMessage.uid() != getuid()) {
+		throw std::runtime_error("System-reported message UID != darlingserver UID");
+	}
+
 	if ((header->number & DSERVER_CALL_UNMANAGED_FLAG) == 0) {
 		// now let's lookup (and possibly create) the process and thread making this call
 		process = processRegistry().registerIfAbsent(header->pid, [&]() {
@@ -143,6 +152,13 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			return nullptr;
 		}
 
+		// Ported from VibeDarling/darlingserver@37cb5e2 (Cristian Magherusan-Stanciu): checked before the thread is
+		// looked up or registered, so a rejected message cannot change a thread's reply address (it was checked after
+		// thread->setAddress()).
+		if (process->id() != requestMessage.pid()) {
+			throw std::runtime_error("System-reported message PID != darlingserver-recorded PID");
+		}
+
 		thread = threadRegistry().registerIfAbsent(header->tid, [&]() {
 			std::shared_ptr<Thread> tmp = nullptr;
 
@@ -172,11 +188,14 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			return nullptr;
 		}
 
-		thread->setAddress(requestMessage.address());
-
-		if (process->id() != requestMessage.pid()) {
-			throw std::runtime_error("System-reported message PID != darlingserver-recorded PID");
+		// Ported from VibeDarling/darlingserver@feef733 (Cristian Magherusan-Stanciu): the thread a call names must
+		// belong to the calling process; otherwise one process could run a call on another's thread and replace its
+		// reply address. (A thread detached at exec is unregistered by notifyDead().)
+		if (thread->process() != process) {
+			throw std::runtime_error("Message TID belongs to a different process");
 		}
+
+		thread->setAddress(requestMessage.address());
 	}
 
 	auto pidString = (process) ? (std::to_string(process->id()) + " (" + std::to_string(process->nsid()) + ")") : (std::to_string(header->pid) + " (-1)");

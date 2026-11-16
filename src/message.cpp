@@ -692,17 +692,29 @@ bool DarlingServer::MessageQueue::receiveMany(int socket) {
 			}
 		}
 
+		// every slot that received gets its header first, so that each one owns the descriptors it carries; if anything
+		// below throws (an allocation), the slots are dropped, which closes them (and the next round makes new ones)
 		for (size_t i = 0; i < ret; ++i) {
 			messages[i].rawHeader() = mmsgs[i].msg_hdr;
+		}
+
+		try {
+		for (size_t i = 0; i < ret; ++i) {
 			if (mmsgs[i].msg_hdr.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) {
 				// body or descriptor set did not fit; dropping it here lets its destructor close the received descriptors
+				// (the slot is kept between rounds: replace it, or its descriptors would stay open)
 				messageLog.warning() << "Dropping incoming message that did not fit the receive buffer (flags " << mmsgs[i].msg_hdr.msg_flags << ")" << messageLog.endLog;
+				messages[i] = Message();
 				continue;
 			}
 			messages[i].data().resize(mmsgs[i].msg_len);
 			messages[i].setAddress(Address(*(const struct sockaddr_un*)mmsgs[i].msg_hdr.msg_name, mmsgs[i].msg_hdr.msg_namelen));
 			_messages.push_back(std::move(messages[i]));
 			messages[i] = Message();
+		}
+		} catch (...) {
+			messages.clear();
+			throw;
 		}
 
 		// x86Sim (Speed 32): a short batch means the queue was empty when recvmmsg() looked. The listener is

@@ -105,8 +105,9 @@ namespace DarlingServer {
 			uint64_t pageCount;
 			int protection;
 			uint64_t mapOffset;
+			uint64_t device;
+			uint64_t inode;
 			bool shared;
-			uint64_t inode; // x86Sim
 			bool anonShared; // x86Sim: MAP_SHARED|MAP_ANON (shmem, "/dev/zero (deleted)" in maps)
 		};
 

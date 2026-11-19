@@ -792,7 +792,7 @@ DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInf
 		throw std::system_error(ESRCH, std::generic_category(), "dead process; can't call memoryRegionInfo");
 	}
 
-	MemoryRegionInfo info;
+	MemoryRegionInfo info = {};
 	std::string path = "/proc/" + std::to_string(_pid) + "/maps";
 	int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
 	if (fd < 0) {
@@ -824,6 +824,7 @@ DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInf
 				if (q.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) info.protection |= PROT_WRITE;
 				if (q.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE) info.protection |= PROT_EXEC;
 				info.shared = (q.vma_flags & PROCMAP_QUERY_VMA_SHARED) != 0;
+				info.device = ((uint64_t)q.dev_major << 32) | q.dev_minor;
 				info.inode = q.inode;
 				info.anonShared = info.shared && q.vma_name_size > 0 && strncmp(name, "/dev/zero", 9) == 0;
 				return info;
@@ -872,7 +873,11 @@ DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInf
 				uintptr_t offset = 0;
 				parseHex(q, lineEnd, offset);
 				skipSpaces(q, lineEnd);
-				q = skipField(q, lineEnd);   // device
+				// device, "major:minor" in hex (the form dtape_hook_fd_identity uses: major << 32 | minor)
+				uintptr_t devMajor = 0, devMinor = 0;
+				parseHex(q, lineEnd, devMajor);
+				if (q < lineEnd && *q == ':') { ++q; parseHex(q, lineEnd, devMinor); }
+				q = skipField(q, lineEnd);
 				skipSpaces(q, lineEnd);
 				uint64_t inode = 0;
 				while (q < lineEnd && *q >= '0' && *q <= '9') inode = inode * 10 + (*q++ - '0');
@@ -887,6 +892,7 @@ DarlingServer::Process::MemoryRegionInfo DarlingServer::Process::memoryRegionInf
 				if (permsView.find('w') != std::string_view::npos) info.protection |= PROT_WRITE;
 				if (permsView.find('x') != std::string_view::npos) info.protection |= PROT_EXEC;
 				info.shared = permsView.find('s') != std::string_view::npos;
+				info.device = ((uint64_t)devMajor << 32) | devMinor;
 				info.inode = inode;
 				// x86Sim: shared anonymous memory is a shmem object Linux names "/dev/zero (deleted)"
 				info.anonShared = info.shared && pathView.rfind("/dev/zero", 0) == 0;

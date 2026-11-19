@@ -36,6 +36,7 @@
 #include <sys/timerfd.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 
 #include <darlingserver/logging.hpp>
@@ -330,9 +331,10 @@ struct DTapeHooks {
 			memory_region_info->start_address = info.startAddress;
 			memory_region_info->page_count = info.pageCount;
 			memory_region_info->map_offset = info.mapOffset;
+			memory_region_info->device = info.device;
+			memory_region_info->inode = info.inode;
 			protection = info.protection;
 			memory_region_info->shared = info.shared;
-			memory_region_info->inode = info.inode;
 			memory_region_info->anon_shared = info.anonShared; // x86Sim
 		} catch (...) {
 			return false;
@@ -367,6 +369,18 @@ struct DTapeHooks {
 		} catch (std::system_error e) {
 			return -1;
 		}
+	};
+
+	// the device and inode that identify the file behind a descriptor, in the same form
+	// as the `device` and `inode` of dtape_memory_region_info_t
+	static bool dtape_hook_fd_identity(int fd, uint64_t* device, uint64_t* inode) {
+		struct stat st;
+		if (fstat(fd, &st) < 0) {
+			return false;
+		}
+		*device = ((uint64_t)major(st.st_dev) << 32) | minor(st.st_dev);
+		*inode = st.st_ino;
+		return true;
 	};
 
 	static uintptr_t dtape_hook_task_map_file(void* task_context, int fd, size_t page_count, int protection, uintptr_t address_hint, size_t page_offset, dtape_memory_flags_t flags) {
@@ -506,6 +520,7 @@ struct DTapeHooks {
 		.task_allocate_pages = dtape_hook_task_allocate_pages,
 		.task_free_pages = dtape_hook_task_free_pages,
 		.task_map_file = dtape_hook_task_map_file,
+		.fd_identity = dtape_hook_fd_identity,
 		.task_get_next_region = dtape_hook_task_get_next_region,
 		.task_change_protection = dtape_hook_task_change_protection,
 		.task_sync_memory = dtape_hook_task_sync_memory,

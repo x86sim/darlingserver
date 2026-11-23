@@ -1,3 +1,4 @@
+#include <atomic>
 // Only the surrounding services are stand-ins. The scheduler, continuation,
 // suspend and return functions are compiled verbatim from src/thread.cpp.
 #pragma once
@@ -43,6 +44,7 @@ struct Log {
 	Log& debug() { return *this; }
 	Log& warning() { return *this; }
 	Log& info() { return *this; }
+	Log& error() { return *this; }
 	template<class T> Log& operator<<(const T&) { return *this; }
 };
 struct StackPool {
@@ -84,6 +86,7 @@ struct Thread: std::enable_shared_from_this<Thread> {
 	libsimple_lock_t* _unlockMeWhenSuspending = nullptr;
 	bool _suspended = false, _running = false, _terminating = false, _dead = false;
 	bool _pendingCallOverride = false, _handlingInterruptedCall = false;
+	std::atomic<bool> _scheduled{false}; // x86Sim (willi/darlingserver#13)
 	bool _didSyscallReturnDuringInterrupt = false, _interruptedForSignal = false;
 	unsigned _bsdReturnValue = 0;
 	std::shared_ptr<Call> _pendingCall, _activeCall;

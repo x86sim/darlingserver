@@ -116,14 +116,14 @@ namespace DarlingServer {
 		std::shared_mutex _rwlock;
 		std::optional<Message> _s2cReply;
 		std::deque<Message> _pendingSavedReplies;
-		void* _s2cReplySempahore = nullptr;
+		dtape_semaphore_t* _s2cReplySempahore = nullptr;
 		bool _s2cCallInFlight = false;
 		bool _s2cStaleReplyPending = false;
 		bool _s2cStaleReplyUsedInterrupt = false;
 		size_t _s2cInterruptAbandoned = 0;
 		bool _s2cInterruptEntered = false;
-		void* _s2cInterruptEnterSemaphore = nullptr;
-		void* _s2cInterruptExitSemaphore = nullptr;
+		dtape_semaphore_t* _s2cInterruptEnterSemaphore = nullptr;
+		dtape_semaphore_t* _s2cInterruptExitSemaphore = nullptr;
 		std::shared_ptr<Call> _pendingCall;
 		std::stack<Interrupt> _interrupts;
 		std::queue<std::shared_ptr<Call>> _pendingInterrupts;
@@ -133,7 +133,7 @@ namespace DarlingServer {
 		pid_t nsid() const { return _nsid; }
 		void setAddress(Address a) { address = a; }
 		void registerWithProcess() {}
-		void setPendingCall(std::shared_ptr<Call> c) { _pendingCall = c; }
+		bool setPendingCall(std::shared_ptr<Call> c) { _pendingCall = c; return true; }
 		size_t _s2cStaleMappingLength = 0;
 		bool _s2cStaleMappingReusable = false;
 		void _s2cNoteStaleMapping(const Message&, size_t, bool) {}

@@ -5,6 +5,7 @@
 #include <darlingserver/duct-tape/hooks.internal.h>
 #include <darlingserver/duct-tape/log.h>
 #include <darlingserver/duct-tape/psynch.h>
+#include <darlingserver/duct-tape/memory.h>
 
 #include <kern/thread.h>
 #include <kern/ipc_tt.h>
@@ -64,10 +65,21 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 
 	thread->context = context;
 	thread->processing_signal = false;
+	thread->kobject_restart_allowed = false;
+	thread->kept_descriptor = NULL;
+	thread->kobject_restart_requested = false;
+	thread->reserved_regions = NULL;
+	thread->reserved_region_count = 0;
+	thread->receive_restart_allowed = false;
+	thread->pending_receive_kmsg = NULL;
+	thread->pending_receive_object = NULL;
+	thread->pending_receive_seqno = 0;
 	thread->name = NULL;
 	thread->waiting_suspended = false;
 	thread->off_task_list = false; // x86Sim (willi/darlingserver#10)
-	libsimple_lock_init(&thread->wake_lock);
+	thread->wakeup_pending = false;
+	thread->interrupt_deferred = false;
+	libsimple_lock_init(&thread->block_suspend_gate);
 	LIST_INIT(&thread->user_states);
 	dtape_mutex_init(&thread->suspension_mutex);
 	dtape_condvar_init(&thread->suspension_condvar);
@@ -125,6 +137,8 @@ void dtape_thread_destroy(dtape_thread_t* thread) {
 	dtape_log_debug("%llu: thread being destroyed", thread->xnu_thread.thread_id);
 
 	dtape_psynch_thread_destroy(thread);
+	dtape_thread_release_kept_descriptor(thread);
+	dtape_thread_abandon_pending_receive(thread);
 
 	// this next section uses code adapted from XNU's thread_deallocate_complete() in osfmk/kern/thread.c
 
@@ -480,9 +494,9 @@ void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread) {
 		// nothing, and we slept here for ever with suspend_count 0 (Safari's main thread after a few relaunches: a black
 		// screen). As in thread_block_parameter(): thread_release() decrements and resumes under the wake lock, and we
 		// check the count and suspend under it (the suspension releases it once we're suspended).
-		libsimple_lock_lock(&thread->wake_lock);
+		libsimple_lock_lock(&thread->block_suspend_gate);
 		if (thread->xnu_thread.suspend_count <= 0) {
-			libsimple_lock_unlock(&thread->wake_lock);
+			libsimple_lock_unlock(&thread->block_suspend_gate);
 			dtape_mutex_lock(&thread->suspension_mutex);
 			thread->waiting_suspended = false;
 			dtape_mutex_unlock(&thread->suspension_mutex);
@@ -492,7 +506,7 @@ void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread) {
 
 		thread->xnu_thread.wait_result = THREAD_WAITING;
 
-		dtape_hooks->thread_suspend(thread->context, NULL, NULL, &thread->wake_lock);
+		dtape_hooks->thread_suspend(thread->context, NULL, NULL, &thread->block_suspend_gate);
 
 		dtape_log_debug("sigexc: woken up");
 
@@ -515,11 +529,38 @@ void dtape_thread_release(dtape_thread_t* thread) {
 	thread_deallocate(&thread->xnu_thread);
 };
 
+// thread locked
+//
+// A wait that ends before its timer fires must cancel the timer. Otherwise the timer stays armed, fires later during an
+// unrelated wait of the same thread, and ends that one with THREAD_TIMED_OUT: an untimed receive returns
+// MACH_RCV_TIMED_OUT, and the server's own untimed semaphore waits (e.g. for an S2C reply) don't expect a timeout at all.
+static void dtape_thread_cancel_wait_timer_locked(thread_t xthread) {
+	if (xthread->wait_timer_is_set) {
+		if (timer_call_cancel(&xthread->wait_timer)) {
+			xthread->wait_timer_active--;
+		}
+		xthread->wait_timer_is_set = FALSE;
+	}
+};
+
 void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
 	thread_lock(&thread->xnu_thread);
-	thread->xnu_thread.state &= ~(TH_UNINT | TH_WAIT);
-	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
-	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
+	// a wait that has already been ended by a wakeup keeps its result, as XNU's clear_wait() leaves a thread that is
+	// no longer waiting alone. the waker may already have completed the operation for this thread (e.g. handed a
+	// receive its message); reporting the wait as interrupted would lose that (the caller would receive again and
+	// wait for a reply that has already been taken off the queue).
+	// the call still has to return for the signal to be handled, so interrupt the next wait it starts instead
+	// (as before, one wait is interrupted per signal).
+	if (thread->wakeup_pending) {
+		thread->interrupt_deferred = true;
+	} else {
+		// with TH_WAIT cleared, clear_wait_internal() only takes the thread off its wait queue (thread_unblock() isn't
+		// called), so cancel the timer of a timed wait here
+		dtape_thread_cancel_wait_timer_locked(&thread->xnu_thread);
+		thread->xnu_thread.state &= ~(TH_UNINT | TH_WAIT);
+		thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
+		clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
+	}
 	thread_unlock(&thread->xnu_thread);
 };
 
@@ -532,6 +573,8 @@ void dtape_thread_sigexc_enter2(dtape_thread_t* thread) {
 	memset(new_user_state, 0, sizeof(*new_user_state));
 
 	thread_lock(&thread->xnu_thread);
+	// the interrupted call is done; waits in the signal handler's own calls are not interrupted
+	thread->interrupt_deferred = false;
 	LIST_INSERT_HEAD(&thread->user_states, new_user_state, link);
 	thread_unlock(&thread->xnu_thread);
 };
@@ -549,6 +592,8 @@ void dtape_thread_sigexc_exit(dtape_thread_t* thread) {
 
 void dtape_thread_dying(dtape_thread_t* thread) {
 	thread_lock(&thread->xnu_thread);
+	// see dtape_thread_sigexc_enter()
+	dtape_thread_cancel_wait_timer_locked(&thread->xnu_thread);
 	thread->xnu_thread.state &= ~(TH_UNINT | TH_WAIT);
 	thread->xnu_thread.state |= TH_TERMINATE;
 	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
@@ -606,6 +651,16 @@ static void thread_continuation_callback(void* context) {
 	thread->xnu_thread.parameter = NULL;
 
 	wait_result = thread->xnu_thread.wait_result;
+
+	if (wait_result == THREAD_WAITING) {
+		// resumed although nobody ended the wait (see thread_block_parameter()); keep waiting
+		thread->xnu_thread.state |= TH_WAIT;
+		thread_unlock(&thread->xnu_thread);
+		thread_block_parameter(continuation, parameter);
+		__builtin_unreachable();
+	}
+
+	thread->wakeup_pending = false;
 	thread_unlock(&thread->xnu_thread);
 
 	continuation(parameter, wait_result);
@@ -615,7 +670,9 @@ static void thread_continuation_callback(void* context) {
 
 wait_result_t thread_block_parameter(thread_continue_t continuation, void* parameter) {
 	dtape_thread_t* thread = dtape_hooks->current_thread();
+	wait_result_t wait_result;
 
+again:
 	thread_lock(&thread->xnu_thread);
 
 	thread->xnu_thread.continuation = continuation;
@@ -627,17 +684,28 @@ wait_result_t thread_block_parameter(thread_continue_t continuation, void* param
 	// yet, and its resume would do nothing: we'd sleep through our wakeup. So take the wake lock, which thread_unblock()
 	// resumes under, before unlocking, and have the suspension release it once we're suspended.
 	if (waiting) {
-		libsimple_lock_lock(&thread->wake_lock);
+		libsimple_lock_lock(&thread->block_suspend_gate);
 	}
 
 	thread_unlock(&thread->xnu_thread);
 
 	if (waiting) {
-		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, &thread->wake_lock);
+		dtape_hooks->thread_suspend(thread->context, continuation ? thread_continuation_callback : NULL, thread, &thread->block_suspend_gate);
 	}
 
 	thread_lock(&thread->xnu_thread);
-	wait_result_t wait_result = thread->xnu_thread.wait_result;
+	wait_result = thread->xnu_thread.wait_result;
+
+	if (waiting && wait_result == THREAD_WAITING) {
+		// we were resumed although nobody ended the wait: a wakeup (thread_unblock() resumes the microthread) can be
+		// left over from an earlier wait that a signal interrupted, and it resumes whatever wait the thread is in
+		// when it runs. we're still on the wait queue, so just keep waiting (the next run clears TH_WAIT again).
+		thread->xnu_thread.state |= TH_WAIT;
+		thread_unlock(&thread->xnu_thread);
+		goto again;
+	}
+
+	thread->wakeup_pending = false;
 	thread_unlock(&thread->xnu_thread);
 
 	if (continuation) {
@@ -657,21 +725,23 @@ wait_result_t thread_block(thread_continue_t continuation) {
 boolean_t thread_unblock(thread_t xthread, wait_result_t wresult) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 
+	// wait until a thread that is about to suspend itself has finished doing so
+	libsimple_lock_lock(&thread->block_suspend_gate);
+
 	thread->xnu_thread.wait_result = wresult;
-	// as XNU does: a timed wait that ended otherwise must not time out a later wait
-	if (thread->xnu_thread.wait_timer_is_set) {
-		if (timer_call_cancel(&thread->xnu_thread.wait_timer)) {
-			thread->xnu_thread.wait_timer_active--;
-		}
-		thread->xnu_thread.wait_timer_is_set = FALSE;
-	}
-	// as XNU does: the wait is over, so a thread_block() that hasn't checked TH_WAIT yet must not suspend
-	// (atomically: see dtape_thread_entering())
-	__atomic_and_fetch(&thread->xnu_thread.state, ~(TH_WAIT | TH_UNINT), __ATOMIC_SEQ_CST);
-	__atomic_or_fetch(&thread->xnu_thread.state, TH_RUN, __ATOMIC_SEQ_CST);
-	libsimple_lock_lock(&thread->wake_lock);
+	thread->wakeup_pending = true;
+
+	// Cancel any pending wait timer, like XNU's thread_unblock() does.
+	dtape_thread_cancel_wait_timer_locked(&thread->xnu_thread);
+
+	// like XNU, the thread is no longer waiting. this matters when the wakeup
+	// comes before the thread reaches thread_block(): it must not suspend then.
+	thread->xnu_thread.state &= ~(TH_WAIT | TH_UNINT);
+	thread->xnu_thread.state |= TH_RUN;
+
 	dtape_hooks->thread_resume(thread->context);
-	libsimple_lock_unlock(&thread->wake_lock);
+
+	libsimple_lock_unlock(&thread->block_suspend_gate);
 	return TRUE;
 };
 
@@ -684,6 +754,17 @@ wait_result_t thread_mark_wait_locked(thread_t thread, wait_interrupt_t interrup
 	// the abort handling is adapted from XNU's thread_mark_wait_locked() in osfmk/kern/sched_prim.c
 	wait_interrupt_t interruptible = interruptible_orig & TH_OPT_INTMASK;
 	boolean_t at_safe_point = (interruptible == THREAD_ABORTSAFE);
+
+	// a new wait begins; any earlier wakeup has been consumed
+	dtape_thread_t* dthread = dtape_thread_for_xnu_thread(thread);
+	dthread->wakeup_pending = false;
+
+	// a call that a signal arrived for after it had been woken up (see dtape_thread_sigexc_enter()) must not block again
+	if (dthread->interrupt_deferred && interruptible != THREAD_UNINT) {
+		dthread->interrupt_deferred = false;
+		thread->pending_block_hint = kThreadWaitNone;
+		return thread->wait_result = THREAD_INTERRUPTED;
+	}
 
 	if (interruptible == THREAD_UNINT ||
 	    !(thread->sched_flags & TH_SFLAG_ABORT) ||
@@ -1513,8 +1594,8 @@ kern_return_t thread_info(thread_t xthread, thread_flavor_t flavor, thread_info_
 			}
 			dtape_mutex_unlock(&thread->suspension_mutex);
 
-			// the calling thread is running, though Linux sees it waiting for our reply
 			if (thread_state == -1 && xthread == current_thread()) {
+				// the calling thread is running, even though Linux sees it blocked in its call to the server
 				thread_state = dtape_thread_state_running;
 			}
 
@@ -1576,29 +1657,43 @@ kern_return_t thread_info(thread_t xthread, thread_flavor_t flavor, thread_info_
 		};
 
 		case THREAD_EXTENDED_INFO: {
-			thread_basic_info_data_t basic;
-			mach_msg_type_number_t basic_count = THREAD_BASIC_INFO_COUNT;
-			kern_return_t kr;
-
 			if (*thread_info_count < THREAD_EXTENDED_INFO_COUNT) {
 				return KERN_INVALID_ARGUMENT;
 			}
-			kr = thread_info(xthread, THREAD_BASIC_INFO, (thread_info_t)&basic, &basic_count);
+
+			thread_extended_info_t info = (thread_extended_info_t)thread_info_out;
+			uint64_t user_ns = 0;
+			uint64_t system_ns = 0;
+
+			memset(info, 0, sizeof(*info));
+
+			// the name and CPU times of the thread come from Linux; the thread's state is derived the same way as for THREAD_BASIC_INFO
+			if (!dtape_hooks->thread_get_stats(thread->context, info->pth_name, sizeof(info->pth_name), &user_ns, &system_ns)) {
+				// the thread has already exited
+				return KERN_TERMINATED;
+			}
+
+			thread_basic_info_data_t basic;
+			mach_msg_type_number_t basic_count = THREAD_BASIC_INFO_COUNT;
+			kern_return_t kr = thread_info(xthread, THREAD_BASIC_INFO, (thread_info_t)&basic, &basic_count);
 			if (kr != KERN_SUCCESS) {
 				return kr;
 			}
-			*thread_info_count = THREAD_EXTENDED_INFO_COUNT;
 
-			thread_extended_info_t info = (thread_extended_info_t)thread_info_out;
-			memset(info, 0, sizeof(*info));
-			info->pth_cpu_usage = basic.cpu_usage;
-			info->pth_policy = basic.policy;
+			info->pth_user_time = user_ns;
+			info->pth_system_time = system_ns;
+			info->pth_cpu_usage = 0;
+			info->pth_policy = POLICY_TIMESHARE;
 			info->pth_run_state = basic.run_state;
-			info->pth_flags = basic.flags;
-			info->pth_sleep_time = basic.sleep_time;
+			info->pth_flags = 0;
+			info->pth_sleep_time = 0;
+
+			// Darling keeps no per-thread scheduling state, so every thread reports the priorities of a default timeshare thread
 			info->pth_curpri = BASEPRI_DEFAULT;
 			info->pth_priority = BASEPRI_DEFAULT;
 			info->pth_maxpriority = MAXPRI_USER;
+
+			*thread_info_count = THREAD_EXTENDED_INFO_COUNT;
 			return KERN_SUCCESS;
 		};
 
@@ -1851,10 +1946,10 @@ void thread_release(thread_t xthread) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 	dtape_log_debug("sigexc: thread_release(%p)\n", xthread);
 	// x86Sim: under the wake lock, see dtape_thread_wait_while_user_suspended()
-	libsimple_lock_lock(&thread->wake_lock);
+	libsimple_lock_lock(&thread->block_suspend_gate);
 	xthread->suspend_count--;
 	dtape_hooks->thread_resume(thread->context);
-	libsimple_lock_unlock(&thread->wake_lock);
+	libsimple_lock_unlock(&thread->block_suspend_gate);
 };
 
 void thread_wait(thread_t xthread, boolean_t until_not_runnable) {

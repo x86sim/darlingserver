@@ -31,6 +31,7 @@
 #include <utility> // x86Sim
 #include <darlingserver/system-config.hpp>
 #include <darlingserver/platform-identity.hpp>
+#include <darlingserver/iosurface.hpp>
 #include <darlingserver/code-signing.hpp>
 #include <darlingserver/trust-store.hpp>
 #include <darling-config.h>
@@ -214,38 +215,47 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 	if (header->number == dserver_callnum_s2c) {
 		// this is an S2C reply
 
-		// x86Sim (willi/darlingserver#10): taken under the lock (a released thread has none) and retained
-		dtape_semaphore_t* replySemaphore;
+		bool stale = false;
+		bool staleUsedInterrupt = false;
+		size_t staleMappingLength = 0;
+		bool staleMappingReusable = false;
+		bool accepted = false;
+
 		{
 			std::unique_lock lock(thread->_rwlock);
 
-			if (thread->_s2cAbandonedReplies > 0) {
-				// x86Sim: the reply to an S2C call whose caller stopped waiting after sending it (Thread::_s2cPerform()).
-				// Taken as the next call's reply, it was that call's "duplicate"; the next call's own reply was dropped,
-				// and its caller got another call's answer (or none, and its thread hung in its S2C interrupt).
-				thread->_s2cAbandonedReplies--;
-				callLog.warning() << *thread << ": dropped the late reply of an abandoned S2C call" << callLog.endLog;
-				return nullptr;
-			}
-
-			if (thread->_s2cReply) {
-				// x86Sim: a client's second S2C reply is its protocol error: drop it instead of throwing out of the
-				// main loop and taking every process down with darlingserver (as willi/darlingserver#7 contains it;
-				// seen once Swift's cooperative pool made workqueue threads come and go much more often)
-				callLog.error() << *thread << ": Received S2C reply but thread already had one pending; dropped it" << callLog.endLog;
-				return nullptr;
-			}
-
-			thread->_s2cReply = std::move(requestMessage);
-			replySemaphore = thread->_s2cReplySempahore;
-			if (replySemaphore) {
-				dtape_semaphore_retain(replySemaphore);
+			if (thread->_s2cStaleReplyPending) {
+				// no new call is sent while an abandoned one is unanswered, so this is the reply to the call
+				// whose wait was interrupted; nobody is waiting for it any more
+				stale = true;
+				staleUsedInterrupt = thread->_s2cStaleReplyUsedInterrupt;
+				staleMappingLength = thread->_s2cStaleMappingLength;
+				staleMappingReusable = thread->_s2cStaleMappingReusable;
+				thread->_s2cStaleReplyPending = false;
+				thread->_s2cStaleReplyUsedInterrupt = false;
+				thread->_s2cStaleMappingLength = 0;
+				thread->_s2cStaleMappingReusable = false;
+			} else if (thread->_s2cCallInFlight && !thread->_s2cReply) {
+				thread->_s2cReply = std::move(requestMessage);
+				accepted = true;
 			}
 		}
 
-		if (replySemaphore) {
-			dtape_semaphore_up(replySemaphore);
-			dtape_semaphore_release(replySemaphore);
+		if (accepted) {
+			dtape_semaphore_up(thread->_s2cReplySempahore);
+		} else if (stale) {
+			callLog.debug() << "Discarding reply to an abandoned S2C call" << callLog.endLog;
+			if (staleMappingLength > 0) {
+				// nobody will use the memory the abandoned mmap call mapped; it is unmapped before the next S2C call
+				thread->_s2cNoteStaleMapping(requestMessage, staleMappingLength, staleMappingReusable);
+			}
+			if (staleUsedInterrupt) {
+				// the client's S2C interrupt handler is waiting for us to let it go
+				dtape_semaphore_up(thread->_s2cInterruptExitSemaphore);
+			}
+		} else {
+			// a misbehaving client can send a reply nobody asked for; dropping it is the only safe thing to do
+			callLog.error() << "Received unexpected S2C reply; ignoring it" << callLog.endLog;
 		}
 
 		return nullptr;
@@ -274,25 +284,33 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 
 		replyToSave.setAddress(requestMessage.address());
 
+		bool pending = false;
 		{
 			std::unique_lock lock(thread->_rwlock);
-			if (thread->_pendingCall && thread->_pendingCall->number() == Call::Number::InterruptEnter) {
+			// the client can push more than one reply: e.g. when a signal arrives while it waits for the reply to
+			// interrupt_exit, the new interrupt_enter sees both that reply and the reply to the call the first signal
+			// interrupted (sent after interrupt_exit). all of them are kept, in order.
+			// the client pushes replies only while it waits for the reply to its latest interrupt_enter, so they belong to
+			// that interrupt. if we haven't started handling it yet, keep them for it.
+			if ((thread->_pendingCall && thread->_pendingCall->number() == Call::Number::InterruptEnter) || !thread->_pendingInterrupts.empty()) {
 				// this means the client got interrupted after we had already sent a reply for the interrupted call,
 				// the client saw this unexpected reply while waiting for interrupt_enter to respond and sent it back to us,
-				// and we received both calls (interrupt_enter and push_reply) at the same time
-				thread->_pendingSavedReply = std::move(replyToSave);
+				// and we received both calls (interrupt_enter and push_reply) at the same time.
+				// the interrupt_enter can also still be queued behind the call that sent the reply (see `Thread::setPendingCall`):
+				// the call has replied, but the interrupt is only scheduled once the call's microthread returns. the reply must
+				// not go to an interrupt that is already being handled: with none, it would be dropped (and the client would
+				// wait for it forever); for a nested interrupt, it would only be sent once the outer interrupt exits.
+				thread->_pendingSavedReplies.push_back(std::move(replyToSave));
+				pending = true;
 			} else {
 				if (thread->_interrupts.empty()) {
 					throw std::runtime_error("Client tried to push reply outside of interrupt");
 				}
-				if (thread->_interrupts.top().savedReply) {
-					throw std::runtime_error("Client-pushed reply overwriting existing saved reply");
-				}
-				thread->_interrupts.top().savedReply = std::move(replyToSave);
+				thread->_interrupts.top().savedReplies.push_back(std::move(replyToSave));
 			}
 		}
 
-		callLog.debug() << *thread << ": Saved client-pushed reply (" << ((thread->_pendingSavedReply) ? "pending" : "normal") << ")" << callLog.endLog;
+		callLog.debug() << *thread << ": Saved client-pushed reply (" << (pending ? "pending" : "normal") << ")" << callLog.endLog;
 
 		// write a byte to the pipe so the caller can continue
 		write(pipeDesc.fd(), &tmp, sizeof(tmp));
@@ -1188,10 +1206,9 @@ void DarlingServer::Call::InterruptExit::processCall() {
 
 		thread->_interrupts.pop();
 
-		if (tmp.savedReply) {
+		for (auto& savedReply: tmp.savedReplies) {
 			callLog.debug() << *thread << ": Going to send saved reply" << callLog.endLog;
-			Server::sharedInstance().sendMessage(std::move(*tmp.savedReply));
-			tmp.savedReply = std::nullopt;
+			Server::sharedInstance().sendMessage(std::move(savedReply));
 		}
 	}
 };
@@ -1445,31 +1462,24 @@ void DarlingServer::Call::S2CPerform::processCall() {
 	int code = 0;
 
 	if (auto thread = _thread.lock()) {
-		callLog.debug() << *thread << ": s2c_perform: giving green light" << callLog.endLog; // x86Sim
-		// x86Sim (willi/darlingserver#14): the request this green light answers, taken with the two semaphores under
-		// the lock and retained (notifyDead() and the release destroy them). With no request, the signal is stale: nothing
-		// waits for this green light, so it's answered at once.
-		dtape_semaphore_t* enterSemaphore = nullptr;
-		dtape_semaphore_t* exitSemaphore = nullptr;
+		bool abandoned = false;
+
 		{
 			std::unique_lock lock(thread->_rwlock);
-			if (thread->_s2cRequest != 0 && thread->_s2cInterruptEnterSemaphore && thread->_s2cInterruptExitSemaphore) {
-				thread->_s2cTaken = std::exchange(thread->_s2cRequest, 0);
-				enterSemaphore = thread->_s2cInterruptEnterSemaphore;
-				exitSemaphore = thread->_s2cInterruptExitSemaphore;
-				dtape_semaphore_retain(enterSemaphore);
-				dtape_semaphore_retain(exitSemaphore);
+			if (thread->_s2cInterruptAbandoned > 0) {
+				// the server stopped waiting for this interrupt; there is nothing to perform, so don't wait for anyone
+				--thread->_s2cInterruptAbandoned;
+				abandoned = true;
+			} else {
+				// from here on, a caller that stops waiting for the green light knows we're about to give it and will let us go
+				thread->_s2cInterruptEntered = true;
 			}
 		}
-		if (enterSemaphore) {
-			dtape_semaphore_up(enterSemaphore);
-			dtape_semaphore_down_simple(exitSemaphore);
-			dtape_semaphore_release(enterSemaphore);
-			dtape_semaphore_release(exitSemaphore);
-		} else {
-			callLog.warning() << *thread << ": s2c_perform: stale S2C signal, no request" << callLog.endLog;
+
+		if (!abandoned) {
+			dtape_semaphore_up(thread->_s2cInterruptEnterSemaphore);
+			dtape_semaphore_down_simple(thread->_s2cInterruptExitSemaphore);
 		}
-		callLog.debug() << *thread << ": s2c_perform: resuming" << callLog.endLog; // x86Sim
 	} else {
 		code = -ESRCH;
 	}
@@ -2155,4 +2165,149 @@ void DarlingServer::Call::CsVerifyImage::processCall() {
 	}
 
 	_sendReply(code, status, flags, codeLimit, pageSizeLog2, libraryValidationOk);
+};
+
+//
+// IOSurface service (see "IOSurface service" in rpc-supplement.h)
+//
+
+void DarlingServer::Call::IosurfaceRetain::processCall() {
+	int code = 0;
+	uint32_t surfaceID = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			code = IOSurfaceRegistry::sharedInstance().retain(process->id(), _body.memory, _body.id_hint, _body.flags, _body.counter_offset, &surfaceID);
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, surfaceID);
+};
+
+void DarlingServer::Call::IosurfaceRelease::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			code = IOSurfaceRegistry::sharedInstance().release(process->id(), _body.surface_id);
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::IosurfaceLookup::processCall() {
+	int code = 0;
+	int memory = -1;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			code = IOSurfaceRegistry::sharedInstance().lookup(process->id(), _body.surface_id, &memory);
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	// the reply takes ownership of the new descriptor
+	_sendReply(code, memory);
+};
+
+void DarlingServer::Call::IosurfacePublishGpuBuffer::processCall() {
+	int code = 0;
+	int published = -1;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			dserver_iosurface_gpu_buffer_t info;
+			if (_body.info_size != sizeof(info)) {
+				code = -EINVAL;
+			} else if (!process->readMemory(_body.info, &info, sizeof(info), &code)) {
+				code = -code;
+			} else {
+				dserver_iosurface_gpu_buffer_t publishedInfo;
+				code = IOSurfaceRegistry::sharedInstance().publishGPUBuffer(process->id(), _body.surface_id, _body.buffer, info, &published, &publishedInfo);
+				if (code == 0 && !process->writeMemory(_body.info, &publishedInfo, sizeof(publishedInfo), &code)) {
+					code = -code;
+					close(published);
+					published = -1;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, published);
+};
+
+void DarlingServer::Call::IosurfaceCopyGpuBuffer::processCall() {
+	int code = 0;
+	int buffer = -1;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			dserver_iosurface_gpu_buffer_t info;
+			if (_body.info_size != sizeof(info)) {
+				code = -EINVAL;
+			} else {
+				code = IOSurfaceRegistry::sharedInstance().copyGPUBuffer(process->id(), _body.surface_id, &buffer, &info);
+				if (code == 0 && !process->writeMemory(_body.info, &info, sizeof(info), &code)) {
+					code = -code;
+					close(buffer);
+					buffer = -1;
+				}
+			}
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, buffer);
+};
+
+void DarlingServer::Call::IosurfaceSetUsage::processCall() {
+	int code = 0;
+
+	if (auto thread = _thread.lock()) {
+		if (auto process = thread->process()) {
+			code = IOSurfaceRegistry::sharedInstance().setUsage(process->id(), _body.surface_id, _body.usage);
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code);
+};
+
+void DarlingServer::Call::IosurfaceGetState::processCall() {
+	int code = 0;
+	IOSurfaceRegistry::State state {};
+
+	if (auto thread = _thread.lock()) {
+		if (thread->process()) {
+			code = IOSurfaceRegistry::sharedInstance().getState(_body.surface_id, &state);
+		} else {
+			code = -ESRCH;
+		}
+	} else {
+		code = -ESRCH;
+	}
+
+	_sendReply(code, state.holders, state.memoryUsers, state.flags);
 };

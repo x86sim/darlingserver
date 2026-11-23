@@ -1568,6 +1568,13 @@ kern_return_t thread_info(thread_t xthread, thread_flavor_t flavor, thread_info_
 			thread_basic_info_t info = (thread_basic_info_t) thread_info_out;
 			dtape_thread_state_t thread_state = -1;
 
+			// the CPU times come from Linux, as for THREAD_EXTENDED_INFO (x86Sim issue #17: they read 0); a thread
+			// that has already exited reads 0
+			char unused_name[MAXTHREADNAMESIZE];
+			uint64_t user_ns = 0;
+			uint64_t system_ns = 0;
+			dtape_hooks->thread_get_stats(thread->context, unused_name, sizeof(unused_name), &user_ns, &system_ns);
+
 			thread_lock(xthread);
 
 			// TODO: fill in these values properly
@@ -1576,10 +1583,10 @@ kern_return_t thread_info(thread_t xthread, thread_flavor_t flavor, thread_info_
 			// scheduled by Linux: a time-shared thread to XNU, as thread_policy_get() and the extended info say
 			info->policy = POLICY_TIMESHARE;
 			info->sleep_time = 0;
-			info->system_time.seconds = 0;
-			info->system_time.microseconds = 0;
-			info->user_time.seconds = 0;
-			info->user_time.microseconds = 0;
+			info->system_time.seconds = (integer_t)(system_ns / NSEC_PER_SEC);
+			info->system_time.microseconds = (integer_t)((system_ns % NSEC_PER_SEC) / NSEC_PER_USEC);
+			info->user_time.seconds = (integer_t)(user_ns / NSEC_PER_SEC);
+			info->user_time.microseconds = (integer_t)((user_ns % NSEC_PER_SEC) / NSEC_PER_USEC);
 
 			info->suspend_count = xthread->user_stop_count;
 

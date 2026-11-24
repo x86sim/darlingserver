@@ -133,6 +133,7 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 			std::shared_ptr<Process> tmp = nullptr;
 
 			int lifetimePipe = -1;
+			bool forkChild = false;
 
 			if (header->number == dserver_callnum_checkin) {
 				auto checkinCall = reinterpret_cast<dserver_rpc_call_checkin_t*>(header);
@@ -140,10 +141,11 @@ std::shared_ptr<DarlingServer::Call> DarlingServer::Call::callFromMessage(Messag
 					lifetimePipe = requestMessage.extractDescriptorAtIndex(checkinCall->body.lifetime_listener_pipe);
 					checkinCall->body.lifetime_listener_pipe = -1;
 				}
+				forkChild = checkinCall->body.is_fork;
 			}
 
 			try {
-				tmp = std::make_shared<Process>(requestMessage.pid(), header->pid, static_cast<Process::Architecture>(header->architecture), lifetimePipe);
+				tmp = std::make_shared<Process>(requestMessage.pid(), header->pid, static_cast<Process::Architecture>(header->architecture), lifetimePipe, forkChild);
 			} catch (std::system_error e) {
 				return tmp;
 			}
@@ -1160,7 +1162,7 @@ void DarlingServer::Call::Sigprocess::processCall() {
 
 	if (auto thread = _thread.lock()) {
 		try {
-			thread->processSignal(_body.bsd_signal_number, _body.linux_signal_number, _body.code, _body.signal_address, _body.thread_state, _body.float_state);
+			thread->processSignal(_body.bsd_signal_number, _body.linux_signal_number, _body.code, _body.signal_address, _header.architecture, _body.thread_state, _body.float_state);
 			newBSDSignal = thread->pendingSignal();
 		} catch (std::system_error e) {
 			code = -e.code().value();
@@ -1450,7 +1452,7 @@ void DarlingServer::Call::ThreadSuspended::processCall() {
 	int code = 0;
 
 	if (auto thread = _thread.lock()) {
-		thread->waitWhileUserSuspended(_body.thread_state, _body.float_state);
+		thread->waitWhileUserSuspended(_header.architecture, _body.thread_state, _body.float_state);
 	} else {
 		code = -ESRCH;
 	}

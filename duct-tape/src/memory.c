@@ -1654,6 +1654,11 @@ static kern_return_t x86sim_vm_map_external(vm_map_t target_map, mach_vm_offset_
 };
 
 kern_return_t mach_vm_msync(vm_map_t map, mach_vm_offset_t address, mach_vm_size_t size, vm_sync_t sync_flags) {
+	if (map == VM_MAP_NULL) {
+		// the port did not name a task whose memory the caller may look at
+		return KERN_INVALID_ARGUMENT;
+	}
+
 	int linux_flags = 0;
 
 	// TODO: give the Linux bits names/macros
@@ -1725,6 +1730,11 @@ kern_return_t mach_vm_page_range_query(vm_map_t map, mach_vm_offset_t address, m
 };
 
 kern_return_t mach_vm_protect(vm_map_t map, mach_vm_offset_t start, mach_vm_size_t size, boolean_t set_maximum, vm_prot_t new_protection) {
+	if (map == VM_MAP_NULL) {
+		// the port did not name a task whose memory the caller may look at
+		return KERN_INVALID_ARGUMENT;
+	}
+
 	// x86Sim (Align 1): XNU's vm_map_protect with set_maximum only lowers (current &= new max) and never grants a
 	// right; this set the current protection to the new maximum (vm_protect(t, a, n, TRUE, VM_PROT_ALL) made a guard
 	// page RWX). There is no maximum on Linux and the current protection of another task isn't known here cheaply:
@@ -1856,6 +1866,11 @@ static vm_prot_t dtape_region_prot(const dtape_memory_region_info_t* region_info
 };
 
 kern_return_t mach_vm_region(vm_map_t map, mach_vm_offset_t* address, mach_vm_size_t* size, vm_region_flavor_t flavor, vm_region_info_t info, mach_msg_type_number_t* count, mach_port_t* object_name) {
+	if (map == VM_MAP_NULL) {
+		// the port did not name a task whose memory the caller may look at
+		return KERN_INVALID_ARGUMENT;
+	}
+
 	kern_return_t kr;
 	dtape_memory_region_info_t region_info;
 	mach_msg_type_number_t needed;
@@ -1935,6 +1950,11 @@ kern_return_t mach_vm_region(vm_map_t map, mach_vm_offset_t* address, mach_vm_si
 };
 
 kern_return_t mach_vm_region_recurse(vm_map_t map, mach_vm_address_t* address, mach_vm_size_t* size, uint32_t* depth, vm_region_recurse_info_t info, mach_msg_type_number_t* infoCnt) {
+	if (map == VM_MAP_NULL) {
+		// the port did not name a task whose memory the caller may look at
+		return KERN_INVALID_ARGUMENT;
+	}
+
 	kern_return_t kr;
 	dtape_memory_region_info_t region_info;
 	mach_msg_type_number_t cnt = *infoCnt;

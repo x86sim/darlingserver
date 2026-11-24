@@ -231,8 +231,22 @@ void* dtape_thread_context(dtape_thread_t* thread) {
 	return thread->context;
 };
 
-int dtape_thread_load_state_from_user(dtape_thread_t* thread, uintptr_t thread_state_address, uintptr_t float_state_address) {
+// The caller's buffers have its build architecture's layout, not the task's under an emulator
+// (x86_64 code in an arm64 task); with no conversion, the state is not transferred.
+static bool dtape_thread_user_state_matches_task(dtape_task_t* task, dserver_rpc_architecture_t caller_architecture) {
+	if (caller_architecture == task->architecture) {
+		return true;
+	}
+	dtape_log_debug("caller architecture %d differs from task architecture %d: thread state transfer skipped", caller_architecture, task->architecture);
+	return false;
+};
+
+int dtape_thread_load_state_from_user(dtape_thread_t* thread, dserver_rpc_architecture_t caller_architecture, uintptr_t thread_state_address, uintptr_t float_state_address) {
 	dtape_task_t* task = dtape_task_for_thread(thread);
+
+	if (!dtape_thread_user_state_matches_task(task, caller_architecture)) {
+		return 0;
+	}
 
 #if __x86_64__ || __i386__
 	if (task->architecture == dserver_rpc_architecture_x86_64) {
@@ -278,8 +292,12 @@ int dtape_thread_load_state_from_user(dtape_thread_t* thread, uintptr_t thread_s
 	return 0;
 };
 
-int dtape_thread_save_state_to_user(dtape_thread_t* thread, uintptr_t thread_state_address, uintptr_t float_state_address) {
+int dtape_thread_save_state_to_user(dtape_thread_t* thread, dserver_rpc_architecture_t caller_architecture, uintptr_t thread_state_address, uintptr_t float_state_address) {
 	dtape_task_t* task = dtape_task_for_thread(thread);
+
+	if (!dtape_thread_user_state_matches_task(task, caller_architecture)) {
+		return 0;
+	}
 
 #if __x86_64__ || __i386__
 	if (task->architecture == dserver_rpc_architecture_x86_64) {
@@ -1577,7 +1595,7 @@ kern_return_t thread_info(thread_t xthread, thread_flavor_t flavor, thread_info_
 
 			thread_lock(xthread);
 
-			// TODO: fill in these values properly
+			// cpu_usage and sleep_time are not tracked: they stay 0
 			info->cpu_usage = 0;
 			info->flags = 0;
 			// scheduled by Linux: a time-shared thread to XNU, as thread_policy_get() and the extended info say
@@ -1591,6 +1609,20 @@ kern_return_t thread_info(thread_t xthread, thread_flavor_t flavor, thread_info_
 			info->suspend_count = xthread->user_stop_count;
 
 			thread_unlock(xthread);
+
+			// the CPU time of the thread as Linux counts it
+			{
+				char name[MAXTHREADNAMESIZE];
+				uint64_t user_ns;
+				uint64_t system_ns;
+
+				if (dtape_hooks->thread_get_stats(thread->context, name, sizeof(name), &user_ns, &system_ns)) {
+					info->user_time.seconds = user_ns / NSEC_PER_SEC;
+					info->user_time.microseconds = (user_ns % NSEC_PER_SEC) / NSEC_PER_USEC;
+					info->system_time.seconds = system_ns / NSEC_PER_SEC;
+					info->system_time.microseconds = (system_ns % NSEC_PER_SEC) / NSEC_PER_USEC;
+				}
+			}
 
 			// check if the thread is currently waiting suspended; in that case, the `thread_get_state` hook will
 			// report that it is waiting interruptibly (because that's what Linux sees), but we know that it's

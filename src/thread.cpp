@@ -1151,15 +1151,15 @@ std::shared_ptr<DarlingServer::Thread> DarlingServer::Thread::threadForPort(uint
 	return thread->shared_from_this();
 };
 
-void DarlingServer::Thread::loadStateFromUser(uint64_t threadState, uint64_t floatState) {
-	int ret = dtape_thread_load_state_from_user(_dtapeThread, threadState, floatState);
+void DarlingServer::Thread::loadStateFromUser(dserver_rpc_architecture_t callerArchitecture, uint64_t threadState, uint64_t floatState) {
+	int ret = dtape_thread_load_state_from_user(_dtapeThread, callerArchitecture, threadState, floatState);
 	if (ret != 0) {
 		throw std::system_error(-ret, std::generic_category());
 	}
 };
 
-void DarlingServer::Thread::saveStateToUser(uint64_t threadState, uint64_t floatState) {
-	int ret = dtape_thread_save_state_to_user(_dtapeThread, threadState, floatState);
+void DarlingServer::Thread::saveStateToUser(dserver_rpc_architecture_t callerArchitecture, uint64_t threadState, uint64_t floatState) {
+	int ret = dtape_thread_save_state_to_user(_dtapeThread, callerArchitecture, threadState, floatState);
 	if (ret != 0) {
 		throw std::system_error(-ret, std::generic_category());
 	}
@@ -1182,9 +1182,9 @@ int DarlingServer::Thread::setPendingSignal(int signal) {
 	return pendingSignal;
 };
 
-void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNumber, int code, uintptr_t signalAddress, uintptr_t threadStateAddress, uintptr_t floatStateAddress) {
+void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNumber, int code, uintptr_t signalAddress, dserver_rpc_architecture_t callerArchitecture, uintptr_t threadStateAddress, uintptr_t floatStateAddress) {
 	try {
-		loadStateFromUser(threadStateAddress, floatStateAddress);
+		loadStateFromUser(callerArchitecture, threadStateAddress, floatStateAddress);
 	} catch (std::system_error e) {
 		// x86Sim: as in waitWhileUserSuspended (process killed meanwhile)
 		threadLog.warning() << *this << ": failed to load state from user in processSignal: " << e.code() << " (" << e.what() << ")" << threadLog.endLog;
@@ -1209,7 +1209,7 @@ void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNu
 		_processingSignal = false;
 	}
 
-	saveStateToUser(threadStateAddress, floatStateAddress);
+	saveStateToUser(callerArchitecture, threadStateAddress, floatStateAddress);
 };
 
 void DarlingServer::Thread::handleSignal(int signal) {
@@ -1805,6 +1805,15 @@ bool DarlingServer::Thread::getStats(char* name, size_t nameSize, uint64_t& user
 		return false;
 	}
 
+	// the threads of the kernel task are not threads of Linux, so Linux has no times for them
+	// (the CPU time of the server is accounted to the task, see Process::cpuTimes())
+	if (process == Process::kernelProcess()) {
+		userTimeNs = 0;
+		systemTimeNs = 0;
+		name[0] = '\0';
+		return true;
+	}
+
 	std::string base = "/proc/" + std::to_string(process->id()) + "/task/" + std::to_string(id());
 	std::string line;
 
@@ -1863,6 +1872,11 @@ DarlingServer::Thread::RunState DarlingServer::Thread::getRunState() const {
 		return RunState::Dead;
 	}
 
+	// the threads of the kernel task are not threads of Linux: they run when the server has work for them
+	if (process == Process::kernelProcess()) {
+		return RunState::Interruptible;
+	}
+
 	std::ifstream file("/proc/" + std::to_string(process->id()) + "/task/" + std::to_string(id()) + "/stat");
 	std::string line;
 	if (!std::getline(file, line)) {
@@ -1892,9 +1906,9 @@ DarlingServer::Thread::RunState DarlingServer::Thread::getRunState() const {
 	}
 };
 
-void DarlingServer::Thread::waitWhileUserSuspended(uintptr_t threadStateAddress, uintptr_t floatStateAddress) {
+void DarlingServer::Thread::waitWhileUserSuspended(dserver_rpc_architecture_t callerArchitecture, uintptr_t threadStateAddress, uintptr_t floatStateAddress) {
 	try {
-		loadStateFromUser(threadStateAddress, floatStateAddress);
+		loadStateFromUser(callerArchitecture, threadStateAddress, floatStateAddress);
 	} catch (std::system_error e) {
 		// x86Sim: the process was killed between its suspension signal and this call (SIGKILL of a task-suspended app):
 		// the read fails. Uncaught, this aborted darlingserver and took the whole phone down.
@@ -1903,7 +1917,7 @@ void DarlingServer::Thread::waitWhileUserSuspended(uintptr_t threadStateAddress,
 	}
 	dtape_thread_wait_while_user_suspended(_dtapeThread);
 	try {
-		saveStateToUser(threadStateAddress, floatStateAddress);
+		saveStateToUser(callerArchitecture, threadStateAddress, floatStateAddress);
 	} catch (std::system_error e) {
 		// if we fail to save the state back to the process, that likely means the process died or was killed while waiting.
 		// it's nothing to worry about. just log it and move on.

@@ -88,6 +88,30 @@ static bool x86sim_frozen_enabled(void);
 
 #define MFD_CLOEXEC 0x1
 
+// x86Sim (issue #39): memfds of guest memory are sealed F_SEAL_SHRINK, so that mtlvk can export their pages as a
+// dma-buf through /dev/udmabuf (UDMABUF_CREATE refuses a memfd without that seal with EINVAL) and import that on
+// amdgpu, where RADV refuses a host-pointer import of shmem pages (libdrm asks USERPTR_ANONONLY). Each is sized once
+// by ftruncate and never shrinks. F_SEAL_WRITE stays off: udmabuf refuses it, and the guest writes these pages.
+#define MFD_ALLOW_SEALING 0x2
+#define F_ADD_SEALS 1033
+#define F_SEAL_SEAL 0x0001
+#define F_SEAL_SHRINK 0x0002
+int fcntl(int fd, int cmd, ...);
+
+static int x86sim_memfd(const char* name, off_t size) {
+	int fd = memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	if (fd < 0) {
+		return -1;
+	}
+	if (ftruncate(fd, size) < 0) {
+		close(fd);
+		return -1;
+	}
+	// a seal refused (an old kernel) costs only the udmabuf import
+	fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_SEAL);
+	return fd;
+}
+
 // x86Sim: every vm_map, for dtape_memory_sweep_tick (a map is unlinked before it is destroyed)
 extern void x86sim_rpcstat_slot(unsigned slot);
 static struct _vm_map* all_maps;
@@ -922,12 +946,8 @@ static kern_return_t x86sim_make_memory_entry(vm_map_t target_map, memory_object
 		prot &= parent->protection;
 	} else if (permission & DT_MAP_MEM_NAMED_CREATE) {
 		entry_size = mach_vm_round_page(*size);
-		int memfd = memfd_create("darling-memory-entry", MFD_CLOEXEC);
+		int memfd = x86sim_memfd("darling-memory-entry", entry_size);
 		if (memfd < 0) {
-			return KERN_RESOURCE_SHORTAGE;
-		}
-		if (ftruncate(memfd, entry_size) < 0) {
-			close(memfd);
 			return KERN_RESOURCE_SHORTAGE;
 		}
 		descriptor = dtape_map_shared_descriptor_create(memfd, entry_size);
@@ -1362,12 +1382,8 @@ static kern_return_t dtape_share_region(vm_map_t map, uintptr_t start, size_t si
 	}
 	dtape_mutex_unlock(&map->shared_entry_lock);
 
-	int memfd = memfd_create("darling-memory-entry", MFD_CLOEXEC);
+	int memfd = x86sim_memfd("darling-memory-entry", size);
 	if (memfd < 0) {
-		return KERN_RESOURCE_SHORTAGE;
-	}
-	if (ftruncate(memfd, size) < 0) {
-		close(memfd);
 		return KERN_RESOURCE_SHORTAGE;
 	}
 	dtape_map_shared_descriptor_t* descriptor = dtape_map_shared_descriptor_create(memfd, size);
@@ -1472,9 +1488,9 @@ static int x86sim_frozen_fd(const uint8_t* src, uint64_t size) {
 	}
 	if (result < 0) {
 		uint64_t rounded = (size + 0xfff) & ~0xfffull;
-		int fd = memfd_create("darling-frozen-copy", MFD_CLOEXEC);
+		int fd = x86sim_memfd("darling-frozen-copy", rounded);
 		void* dst = MAP_FAILED;
-		if (fd >= 0 && ftruncate(fd, rounded) == 0) {
+		if (fd >= 0) {
 			dst = mmap(NULL, rounded, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
 		}
 		if (dst != MAP_FAILED) {

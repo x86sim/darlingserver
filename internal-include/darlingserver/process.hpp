@@ -161,6 +161,8 @@ namespace DarlingServer {
 		// x86Sim: execs of a Darling image announced by a checkout and not yet ended by the new image's main-thread check-in
 		// or a failure report (see noteExecCheckout)
 		unsigned int _execsInFlight = 0;
+		bool _stoppedAtStart = false;
+		bool _pendingReplacement = false;
 		std::unordered_map<uintptr_t, std::shared_ptr<Kqchan>> _kqchannels;
 		std::unordered_map<uintptr_t, std::weak_ptr<Kqchan::Process>> _listeningKqchannels;
 		dtape_semaphore_t* _dtapeForkWaitSemaphore;
@@ -243,6 +245,8 @@ namespace DarlingServer {
 		bool startSuspended() const;
 		void setStartSuspended(bool startSuspended);
 		void setSpawnExec(bool spawnExec); // x86Sim
+		bool stoppedAtStart() const;
+		void setStoppedAtStart(bool stoppedAtStart);
 
 		bool readMemory(uintptr_t remoteAddress, void* localBuffer, size_t length, int* errorCode = nullptr) const;
 		bool writeMemory(uintptr_t remoteAddress, const void* localBuffer, size_t length, int* errorCode = nullptr) const;

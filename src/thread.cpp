@@ -1182,7 +1182,7 @@ int DarlingServer::Thread::setPendingSignal(int signal) {
 	return pendingSignal;
 };
 
-void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNumber, int code, uintptr_t signalAddress, dserver_rpc_architecture_t callerArchitecture, uintptr_t threadStateAddress, uintptr_t floatStateAddress) {
+void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNumber, int code, uintptr_t signalAddress, dserver_rpc_architecture_t callerArchitecture, uintptr_t threadStateAddress, uintptr_t floatStateAddress, const std::optional<dtape_exception_state_t>& exceptionState) {
 	try {
 		loadStateFromUser(callerArchitecture, threadStateAddress, floatStateAddress);
 	} catch (std::system_error e) {
@@ -1190,6 +1190,7 @@ void DarlingServer::Thread::processSignal(int bsdSignalNumber, int linuxSignalNu
 		threadLog.warning() << *this << ": failed to load state from user in processSignal: " << e.code() << " (" << e.what() << ")" << threadLog.endLog;
 		return;
 	}
+	dtape_thread_set_exception_state(_dtapeThread, exceptionState ? &*exceptionState : nullptr);
 
 	{
 		std::unique_lock lock(_rwlock);
@@ -1573,6 +1574,11 @@ uintptr_t DarlingServer::Thread::_mmap(uintptr_t address, size_t length, int pro
 	s2cLog.debug() << "_mmap returned address=" << reply->address << ", errno_result=" << reply->errno_result << s2cLog.endLog;
 
 	outErrno = reply->errno_result;
+	if (reply->errno_result != 0) {
+		// a 32-bit client reports its failed mmap as 0xffffffff, which is not MAP_FAILED for this 64-bit
+		// comparison; the errno is the same for every client architecture
+		return (uintptr_t)MAP_FAILED;
+	}
 	return reply->address;
 };
 
@@ -1661,7 +1667,10 @@ int DarlingServer::Thread::_msync(uintptr_t address, size_t size, int sync_flags
 
 uintptr_t DarlingServer::Thread::allocatePages(size_t pageCount, int protection, uintptr_t addressHint, bool fixed, bool overwrite) {
 	int err = 0;
-	int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+	// As XNU, set no memory aside when mapping: pages are committed as they
+	// are touched (see the BSD mmap() in libsystem_kernel; test:
+	// mmap-large-anonymous.c in Darling's xnu tests).
+	int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
 	if (fixed && overwrite) {
 		flags |= MAP_FIXED;
 	} else if (fixed) {
@@ -2047,7 +2056,7 @@ void DarlingServer::Thread::_scheduleRelease() {
 	});
 };
 
-void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
+void DarlingServer::Thread::_handleInterruptEnterForCurrentThread(bool transparent) {
 	// FIXME: this currently does not work properly if the thread was suspended waiting for a lock
 	Thread* self = currentThread().get();
 	auto& interrupt = self->_interrupts.top();
@@ -2067,7 +2076,7 @@ void DarlingServer::Thread::_handleInterruptEnterForCurrentThread() {
 		interrupt.continuation = std::exchange(self->_interruptedContinuation, nullptr);
 	}
 
-	dtape_thread_sigexc_enter(self->_dtapeThread);
+	dtape_thread_sigexc_enter(self->_dtapeThread, transparent);
 
 	self->_didSyscallReturnDuringInterrupt = false;
 	getcontext(&self->_syscallReturnHereDuringInterrupt);

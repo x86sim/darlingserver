@@ -78,17 +78,9 @@ void dtape_mutex_lock(dtape_mutex_t* mutex) {
 
 	dtape_mutex_assert(mutex, false);
 
-	thread->mutex_link.link.tqe_prev = NULL;
+	libsimple_lock_lock(&mutex->dtape_queue_lock);
+
 	while (true) {
-		libsimple_lock_lock(&mutex->dtape_queue_lock);
-
-		// x86Sim (Input 3): resumed by something other than the unlock below (see dtape_condvar_wait): our link is
-		// still queued; inserting it again would make the queue loop on it
-		if (thread->mutex_link.link.tqe_prev != NULL) {
-			TAILQ_REMOVE(&mutex->dtape_queue_head, &thread->mutex_link, link);
-			thread->mutex_link.link.tqe_prev = NULL;
-		}
-
 		if (mutex->dtape_owner == 0 || mutex->dtape_owner == (uintptr_t)xthread) {
 			// lock successfully acquired
 			mutex->dtape_owner = (uintptr_t)xthread;
@@ -102,6 +94,18 @@ void dtape_mutex_lock(dtape_mutex_t* mutex) {
 
 		// this call drops the lock
 		dtape_hooks->thread_suspend(thread->context, NULL, NULL, &mutex->dtape_queue_lock);
+
+		// dtape_mutex_unlock() takes the thread it wakes off the queue, but a thread can also resume here without
+		// having been woken, as in dtape_condvar_wait(). leave the queue in that case, too; inserting the link again
+		// while it is still queued would corrupt the queue.
+		libsimple_lock_lock(&mutex->dtape_queue_lock);
+		dtape_mutex_link_t* link;
+		TAILQ_FOREACH(link, &mutex->dtape_queue_head, link) {
+			if (link == &thread->mutex_link) {
+				TAILQ_REMOVE(&mutex->dtape_queue_head, link, link);
+				break;
+			}
+		}
 	}
 };
 
@@ -168,7 +172,6 @@ void dtape_mutex_unlock(dtape_mutex_t* mutex) {
 	// contended case
 	// one or more microthreads are waiting; wake the oldest waiter (the one at the head of queue).
 	TAILQ_REMOVE(&mutex->dtape_queue_head, link, link);
-	link->link.tqe_prev = NULL; // x86Sim: dequeued (see dtape_mutex_lock)
 	dtape_thread_t* thread = __container_of(link, dtape_thread_t, mutex_link);
 	dtape_hooks->thread_resume(thread->context);
 

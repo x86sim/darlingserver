@@ -120,6 +120,10 @@ DarlingServer::Process::Process(ID id, NSID nsid, Architecture architecture, int
 
 	// NOTE: see thread.cpp for why it's okay to use `this` here
 	_dtapeTask = dtape_task_create(parentProcess ? parentProcess->_dtapeTask : nullptr, _nspid, this, static_cast<dserver_rpc_architecture_t>(_architecture));
+	if (parentProcess && forkChild) {
+		// a fork child's dyld does not run again to report its image information (an exec reports it anew)
+		dtape_task_inherit_dyld_info(_dtapeTask, parentProcess->_dtapeTask);
+	}
 	_dtapeForkWaitSemaphore = dtape_semaphore_create(_dtapeTask, 0);
 
 	processLog.info() << "New process created with ID " << _pid << " and NSID " << _nspid;
@@ -244,6 +248,16 @@ void DarlingServer::Process::setStartSuspended(bool startSuspended) {
 void DarlingServer::Process::setSpawnExec(bool spawnExec) {
 	std::unique_lock lock(_rwlock);
 	_spawnExec = spawnExec;
+};
+
+bool DarlingServer::Process::stoppedAtStart() const {
+	std::shared_lock lock(_rwlock);
+	return _stoppedAtStart;
+};
+
+void DarlingServer::Process::setStoppedAtStart(bool stoppedAtStart) {
+	std::unique_lock lock(_rwlock);
+	_stoppedAtStart = stoppedAtStart;
 };
 
 bool DarlingServer::Process::_readOrWriteMemory(bool isWrite, uintptr_t remoteAddress, void* localBuffer, size_t length, int* errorCode) const {

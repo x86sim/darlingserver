@@ -408,6 +408,7 @@ void DarlingServer::Message::_ensureDescriptorHeader(size_t newSpace) {
 
 	auto tmp = static_cast<decltype(_controlHeader)>(malloc(controlLen));
 	auto old = _controlHeader;
+	auto oldFdHeader = _descriptorHeader();
 	struct cmsghdr* fdHeader = nullptr;
 
 	if (!tmp) {
@@ -422,6 +423,11 @@ void DarlingServer::Message::_ensureDescriptorHeader(size_t newSpace) {
 		fdHeader = reinterpret_cast<decltype(_controlHeader)>(reinterpret_cast<char*>(_controlHeader) + CMSG_SPACE(sizeof(struct ucred)));
 	} else {
 		fdHeader = _controlHeader;
+	}
+
+	// the descriptors pushed so far stay (the new header is written over the same layout below)
+	if (oldFdHeader && newSpace > 0) {
+		memcpy(CMSG_DATA(fdHeader), CMSG_DATA(oldFdHeader), sizeof(int) * (oldSpace < newSpace ? oldSpace : newSpace));
 	}
 
 	free(old);

@@ -35,6 +35,10 @@
 #define LINUX_SI_USER 0
 #define LINUX_SI_KERNEL 0x80
 #define LINUX_TRAP_HWBKPT 4
+#define LINUX_SEGV_ACCERR 2
+#define LINUX_SEGV_PKUERR 4
+#define LINUX_BUS_ADRERR 2
+#define LINUX_BUS_OBJERR 3
 
 #define LINUX_SIGSEGV 11
 #define LINUX_SIGBUS 7
@@ -74,12 +78,18 @@ dtape_thread_t* dtape_thread_create(dtape_task_t* task, uint64_t nsid, void* con
 	thread->pending_receive_kmsg = NULL;
 	thread->pending_receive_object = NULL;
 	thread->pending_receive_seqno = 0;
+	thread->sq_local_wait = false;
+	thread->sq_local_wait_result = false;
 	thread->name = NULL;
 	thread->waiting_suspended = false;
 	thread->off_task_list = false; // x86Sim (willi/darlingserver#10)
 	thread->wakeup_pending = false;
 	thread->interrupt_deferred = false;
+	thread->wait_restart = false;
 	libsimple_lock_init(&thread->block_suspend_gate);
+	libsimple_lock_init(&thread->suspension_gate);
+	thread->parked_suspended = false;
+	thread->suspension_dying = false;
 	LIST_INIT(&thread->user_states);
 	dtape_mutex_init(&thread->suspension_mutex);
 	dtape_condvar_init(&thread->suspension_condvar);
@@ -197,8 +207,10 @@ void dtape_thread_destroy(dtape_thread_t* thread) {
 // exits: a plain read-modify-write could undo its update (bringing TH_WAIT back). The thread lock can't be taken here:
 // our callers hold the thread's _rwlock, which thread_unblock() takes (to resume us) with the thread lock held.
 void dtape_thread_entering(dtape_thread_t* thread) {
-	// if the thread is entering, it cannot be waiting
-	__atomic_and_fetch(&thread->xnu_thread.state, ~(TH_WAIT | TH_UNINT), __ATOMIC_SEQ_CST);
+	// a running thread is not waiting.
+	// TH_UNINT stays: a thread resumed although nobody ended its wait is still on the wait queue and goes back to
+	// waiting (see thread_block_parameter()), and that wait must still not be interrupted. ending a wait clears it.
+	__atomic_and_fetch(&thread->xnu_thread.state, ~TH_WAIT, __ATOMIC_SEQ_CST);
 	__atomic_or_fetch(&thread->xnu_thread.state, TH_RUN, __ATOMIC_SEQ_CST);
 	thread->xnu_thread.block_hint = kThreadWaitNone;
 };
@@ -229,6 +241,16 @@ dtape_thread_t* dtape_thread_for_port(uint32_t thread_port) {
 
 void* dtape_thread_context(dtape_thread_t* thread) {
 	return thread->context;
+};
+
+void dtape_thread_set_exception_state(dtape_thread_t* thread, const dtape_exception_state_t* state) {
+	thread_lock(&thread->xnu_thread);
+	dtape_thread_user_state_t* user_state = LIST_FIRST(&thread->user_states);
+	user_state->has_exception_state = state != NULL;
+	if (state) {
+		user_state->exception_state = *state;
+	}
+	thread_unlock(&thread->xnu_thread);
 };
 
 // The caller's buffers have its build architecture's layout, not the task's under an emulator
@@ -359,7 +381,12 @@ void dtape_thread_process_signal(dtape_thread_t* thread, int bsd_signal_number, 
 	mach_exception_data_type_t codes[EXCEPTION_CODE_MAX] = { 0, 0 };
 	dtape_task_t* task = dtape_task_for_thread(thread);
 
+	// the thread's user state has been captured and it parks before it returns to user code if it is suspended
+	// (dtape_thread_wait_while_user_suspended()), so thread_wait() need not wait for it; see there
+	dtape_mutex_lock(&thread->suspension_mutex);
 	thread->processing_signal = true;
+	dtape_mutex_unlock(&thread->suspension_mutex);
+	dtape_condvar_signal(&thread->suspension_condvar, SIZE_MAX);
 
 	if (code == LINUX_SI_USER) {
 		if (task->has_sigexc) {
@@ -375,18 +402,30 @@ void dtape_thread_process_signal(dtape_thread_t* thread, int bsd_signal_number, 
 
 	int mach_exception = 0;
 	switch (linux_signal_number) {
-		case LINUX_SIGSEGV: // KERN_INVALID_ADDRESS
+		// as in XNU's page fault handling, the code is the reason the access failed and the subcode its address;
+		// ux_exception() then gives SIGSEGV for KERN_INVALID_ADDRESS and SIGBUS for the others, as macOS does
+		case LINUX_SIGSEGV:
 			mach_exception = EXC_BAD_ACCESS;
-			codes[0] = KERN_INVALID_ADDRESS;
+			if (code == LINUX_SEGV_ACCERR || code == LINUX_SEGV_PKUERR) {
+				codes[0] = KERN_PROTECTION_FAILURE;
+			} else {
+				codes[0] = KERN_INVALID_ADDRESS;
+			}
 			codes[1] = signal_address;
 			break;
 		case LINUX_SIGBUS:
 			mach_exception = EXC_BAD_ACCESS;
+			if (code == LINUX_BUS_ADRERR || code == LINUX_BUS_OBJERR) {
+				// e.g. a file mapping accessed past the end of the file
+				codes[0] = KERN_MEMORY_ERROR;
+				codes[1] = signal_address;
+			} else {
 #if defined(__aarch64__)
-			codes[0] = EXC_ARM_DA_ALIGN;
+				codes[0] = EXC_ARM_DA_ALIGN;
 #else
-			codes[0] = EXC_I386_ALIGNFLT;
+				codes[0] = EXC_I386_ALIGNFLT;
 #endif
+			}
 			break;
 		case LINUX_SIGILL:
 			mach_exception = EXC_BAD_INSTRUCTION;
@@ -450,7 +489,9 @@ void dtape_thread_process_signal(dtape_thread_t* thread, int bsd_signal_number, 
 	dtape_log_debug("exception_triage_thread returned");
 
 out:
+	dtape_mutex_lock(&thread->suspension_mutex);
 	thread->processing_signal = false;
+	dtape_mutex_unlock(&thread->suspension_mutex);
 };
 
 extern int ux_exception(int exception, mach_exception_code_t code, mach_exception_subcode_t subcode);
@@ -498,7 +539,14 @@ void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread) {
 	//         2. we can register the signalfd only when we receive a signal, since we only need to check for pending signals during sigprocess,
 	//            but this means signal processing incurs an additional delay.
 
-	while (thread->xnu_thread.suspend_count > 0) {
+	for (;;) {
+		libsimple_lock_lock(&thread->suspension_gate);
+		bool park = thread->xnu_thread.suspend_count > 0 && !thread->suspension_dying;
+		libsimple_lock_unlock(&thread->suspension_gate);
+		if (!park) {
+			break;
+		}
+
 		dtape_log_debug("sigexc: going to sleep");
 
 		dtape_mutex_lock(&thread->suspension_mutex);
@@ -506,25 +554,19 @@ void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread) {
 		dtape_mutex_unlock(&thread->suspension_mutex);
 		dtape_condvar_signal(&thread->suspension_condvar, SIZE_MAX);
 
-		// x86Sim: the suspender's thread_wait() returns as soon as waiting_suspended is set, and a thread_resume()
-		// (JSC's GC: thread_suspend, thread_get_state, thread_resume, a few microseconds apart) could then run
-		// thread_release() before this microthread was suspended: Thread::resume() of a thread that isn't suspended does
-		// nothing, and we slept here for ever with suspend_count 0 (Safari's main thread after a few relaunches: a black
-		// screen). As in thread_block_parameter(): thread_release() decrements and resumes under the wake lock, and we
-		// check the count and suspend under it (the suspension releases it once we're suspended).
-		libsimple_lock_lock(&thread->block_suspend_gate);
-		if (thread->xnu_thread.suspend_count <= 0) {
-			libsimple_lock_unlock(&thread->block_suspend_gate);
-			dtape_mutex_lock(&thread->suspension_mutex);
-			thread->waiting_suspended = false;
-			dtape_mutex_unlock(&thread->suspension_mutex);
-			dtape_condvar_signal(&thread->suspension_condvar, SIZE_MAX);
-			break;
+		// a release or the thread's death between a check and our suspension would find nothing to resume.
+		// both take the gate, which is held from the final check until we are suspended (the server unlocks it then)
+		libsimple_lock_lock(&thread->suspension_gate);
+		park = thread->xnu_thread.suspend_count > 0 && !thread->suspension_dying;
+		if (park) {
+			thread->parked_suspended = true;
+			thread->xnu_thread.wait_result = THREAD_WAITING;
+			dtape_hooks->thread_suspend(thread->context, NULL, NULL, &thread->suspension_gate);
+			libsimple_lock_lock(&thread->suspension_gate);
+			thread->parked_suspended = false;
 		}
-
-		thread->xnu_thread.wait_result = THREAD_WAITING;
-
-		dtape_hooks->thread_suspend(thread->context, NULL, NULL, &thread->block_suspend_gate);
+		bool dying = thread->suspension_dying;
+		libsimple_lock_unlock(&thread->suspension_gate);
 
 		dtape_log_debug("sigexc: woken up");
 
@@ -533,7 +575,7 @@ void dtape_thread_wait_while_user_suspended(dtape_thread_t* thread) {
 		dtape_mutex_unlock(&thread->suspension_mutex);
 		dtape_condvar_signal(&thread->suspension_condvar, SIZE_MAX);
 
-		if (thread->xnu_thread.wait_result == THREAD_INTERRUPTED) {
+		if (!park || dying) {
 			break;
 		}
 	}
@@ -561,17 +603,24 @@ static void dtape_thread_cancel_wait_timer_locked(thread_t xthread) {
 	}
 };
 
-void dtape_thread_sigexc_enter(dtape_thread_t* thread) {
+void dtape_thread_sigexc_enter(dtape_thread_t* thread, bool transparent) {
 	thread_lock(&thread->xnu_thread);
 	// a wait that has already been ended by a wakeup keeps its result, as XNU's clear_wait() leaves a thread that is
 	// no longer waiting alone. the waker may already have completed the operation for this thread (e.g. handed a
 	// receive its message); reporting the wait as interrupted would lose that (the caller would receive again and
 	// wait for a reply that has already been taken off the queue).
 	// the call still has to return for the signal to be handled, so interrupt the next wait it starts instead
-	// (as before, one wait is interrupted per signal).
+	// (as before, one wait is interrupted per signal). a transparent interrupt (one of Darling's own: a thread
+	// suspension or a server-to-client call) has no handler of the application to run, so it doesn't need that.
 	if (thread->wakeup_pending) {
-		thread->interrupt_deferred = true;
+		if (!transparent) {
+			thread->interrupt_deferred = true;
+		}
 	} else {
+		// the call has to return for the signal handler to talk to us, but in XNU, a thread suspension or a
+		// server-to-client call doesn't end a wait; see semaphore_wait_continue(). (TH_WAIT doesn't tell whether the
+		// call is waiting: it was cleared when the thread started running this interrupt_enter.)
+		thread->wait_restart = transparent && thread->xnu_thread.wait_result == THREAD_WAITING;
 		// with TH_WAIT cleared, clear_wait_internal() only takes the thread off its wait queue (thread_unblock() isn't
 		// called), so cancel the timer of a timed wait here
 		dtape_thread_cancel_wait_timer_locked(&thread->xnu_thread);
@@ -593,6 +642,7 @@ void dtape_thread_sigexc_enter2(dtape_thread_t* thread) {
 	thread_lock(&thread->xnu_thread);
 	// the interrupted call is done; waits in the signal handler's own calls are not interrupted
 	thread->interrupt_deferred = false;
+	thread->wait_restart = false;
 	LIST_INSERT_HEAD(&thread->user_states, new_user_state, link);
 	thread_unlock(&thread->xnu_thread);
 };
@@ -609,6 +659,10 @@ void dtape_thread_sigexc_exit(dtape_thread_t* thread) {
 };
 
 void dtape_thread_dying(dtape_thread_t* thread) {
+	// a thread that has not parked yet sees this and doesn't (see dtape_thread_wait_while_user_suspended());
+	// one that has is resumed by the caller
+	libsimple_lock_lock(&thread->suspension_gate);
+	thread->suspension_dying = true;
 	thread_lock(&thread->xnu_thread);
 	// see dtape_thread_sigexc_enter()
 	dtape_thread_cancel_wait_timer_locked(&thread->xnu_thread);
@@ -617,6 +671,7 @@ void dtape_thread_dying(dtape_thread_t* thread) {
 	thread->xnu_thread.wait_result = THREAD_INTERRUPTED;
 	clear_wait_internal(&thread->xnu_thread, THREAD_INTERRUPTED);
 	thread_unlock(&thread->xnu_thread);
+	libsimple_lock_unlock(&thread->suspension_gate);
 
 	// x86Sim (willi/darlingserver#10): off its task's thread list, as XNU's thread_terminate_daemon() takes a terminated
 	// thread: task_threads() no longer lists it. A dead thread kept until its process dies is released later, and
@@ -787,7 +842,8 @@ wait_result_t thread_mark_wait_locked(thread_t thread, wait_interrupt_t interrup
 	if (interruptible == THREAD_UNINT ||
 	    !(thread->sched_flags & TH_SFLAG_ABORT) ||
 	    (!at_safe_point && (thread->sched_flags & TH_SFLAG_ABORTSAFELY))) {
-		thread->state = TH_WAIT;
+		// TH_UNINT keeps clear_wait_internal(THREAD_INTERRUPTED) (e.g. from thread_abort()) from ending the wait
+		thread->state = (interruptible == THREAD_UNINT) ? (TH_WAIT | TH_UNINT) : TH_WAIT;
 		thread->at_safe_point = at_safe_point;
 		thread->wait_result = THREAD_WAITING;
 		thread->block_hint = thread->pending_block_hint;
@@ -1308,6 +1364,53 @@ thread_get_state_internal(
 
 				return KERN_SUCCESS;
 			}
+			case x86_EXCEPTION_STATE:
+			{
+				x86_exception_state_t* s = (x86_exception_state_t*) state;
+
+				if (*state_count < x86_EXCEPTION_STATE_COUNT)
+					return KERN_INVALID_ARGUMENT;
+				if (dtask->architecture != dserver_rpc_architecture_x86_64)
+					return KERN_INVALID_ARGUMENT;
+
+				memset(s, 0, sizeof(*s));
+				mach_msg_type_number_t count = x86_EXCEPTION_STATE64_COUNT;
+				kern_return_t kr = thread_get_state_internal(thread, x86_EXCEPTION_STATE64, (thread_state_t) &s->ues.es64, &count, to_user);
+				if (kr != KERN_SUCCESS)
+					return kr;
+
+				s->esh.flavor = x86_EXCEPTION_STATE64;
+				s->esh.count = x86_EXCEPTION_STATE64_COUNT;
+				*state_count = x86_EXCEPTION_STATE_COUNT;
+				return KERN_SUCCESS;
+			}
+			case x86_EXCEPTION_STATE64:
+			{
+				if (*state_count < x86_EXCEPTION_STATE64_COUNT)
+					return KERN_INVALID_ARGUMENT;
+				if (dtask->architecture != dserver_rpc_architecture_x86_64)
+					return KERN_INVALID_ARGUMENT;
+
+				// the thread's signal frame can end (and its user state be freed) meanwhile
+				thread_lock(thread);
+				dtape_thread_user_state_t* current = LIST_FIRST(&dthread->user_states);
+				bool has_exception_state = current->has_exception_state;
+				dtape_exception_state_t exception_state = current->exception_state;
+				thread_unlock(thread);
+
+				// known only for signal frames whose state libsystem_kernel supplies
+				if (!has_exception_state)
+					return KERN_INVALID_ARGUMENT;
+
+				x86_exception_state64_t* s = (x86_exception_state64_t*) state;
+				*state_count = x86_EXCEPTION_STATE64_COUNT;
+				memset(s, 0, sizeof(*s));
+				s->trapno = exception_state.trapno;
+				s->err = exception_state.err;
+				s->faultvaddr = exception_state.fault_address;
+
+				return KERN_SUCCESS;
+			}
 			case x86_DEBUG_STATE64:
 			{
 				if (*state_count < x86_DEBUG_STATE64_COUNT)
@@ -1467,15 +1570,31 @@ kern_return_t act_set_state_from_user(thread_t thread, int flavor, thread_state_
 };
 
 kern_return_t thread_abort(thread_t thread) {
-	// x86Sim: guest-reachable through MIG; was dtape_stub_unsafe (a guest call aborted darlingserver and every process).
-	// Breaks the thread out of an interruptible wait in the server (mach_msg, semaphores, psynch) with
-	// THREAD_INTERRUPTED, as XNU's act_abort() + clear_wait() do. A Linux syscall in progress is not interrupted
-	// (as thread_abort_safely here).
+	// adapted from XNU's thread_abort() and act_abort() in osfmk/kern/thread_act.c.
+	// like thread_abort_safely(), this only interrupts waits inside darlingserver; a wait the thread makes
+	// itself (e.g. a sleep, which is a Linux nanosleep in libsystem_kernel) continues.
+	kern_return_t result = KERN_SUCCESS;
+
 	if (thread == THREAD_NULL) {
 		return KERN_INVALID_ARGUMENT;
 	}
-	clear_wait(thread, THREAD_INTERRUPTED);
-	return KERN_SUCCESS;
+
+	thread_lock(thread);
+	if (!thread->active) {
+		result = KERN_TERMINATED;
+	} else {
+		// an abort that is already pending becomes a full one
+		thread->sched_flags |= TH_SFLAG_ABORT;
+		thread->sched_flags &= ~TH_SFLAG_ABORTSAFELY;
+		// AST_APC makes waits that retry after an interruption give up instead (e.g. the wait for an
+		// exception handler's reply in mach_msg_rpc_from_kernel()). thread_abort_safely() doesn't set it,
+		// so a promoted safe abort needs it too.
+		thread_ast_set(thread, AST_APC);
+		clear_wait_internal(thread, THREAD_INTERRUPTED);
+	}
+	thread_unlock(thread);
+
+	return result;
 };
 
 kern_return_t thread_abort_safely(thread_t thread) {
@@ -1509,6 +1628,7 @@ void dtape_thread_returning_to_user(dtape_thread_t* thread) {
 
 	thread_lock(xthread);
 	xthread->sched_flags &= ~TH_SFLAG_ABORTED_MASK;
+	thread_ast_clear(xthread, AST_APC);
 	thread_unlock(xthread);
 };
 
@@ -1960,11 +2080,16 @@ static bool dtape_thread_hold(thread_t xthread) {
 	dtape_log_debug("sigexc: thread_hold(%p)\n", xthread);
 	// CHECKME: the LKM was always sending the signal whenever thread_hold got called;
 	//          we mimic XNU here instead. check whether this actually works as expected.
-	if (xthread->suspend_count++ == 0) {
+	libsimple_lock_lock(&thread->suspension_gate);
+	bool first = xthread->suspend_count++ == 0;
+	libsimple_lock_unlock(&thread->suspension_gate);
+	if (first) {
 		// This signal leads to sigexc.c which will end up calling darlingserver;
 		// darlingserver will hold the caller so long as the suspend_count > 0.
 		if (dtape_hooks->thread_send_signal(thread->context, LINUX_SIGRTMIN) == -ESRCH) {
+			libsimple_lock_lock(&thread->suspension_gate);
 			xthread->suspend_count--;
+			libsimple_lock_unlock(&thread->suspension_gate);
 			return false;
 		}
 	}
@@ -1978,17 +2103,22 @@ void thread_hold(thread_t xthread) {
 void thread_release(thread_t xthread) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
 	dtape_log_debug("sigexc: thread_release(%p)\n", xthread);
-	// x86Sim: under the wake lock, see dtape_thread_wait_while_user_suspended()
-	libsimple_lock_lock(&thread->block_suspend_gate);
-	xthread->suspend_count--;
-	dtape_hooks->thread_resume(thread->context);
-	libsimple_lock_unlock(&thread->block_suspend_gate);
+	// see dtape_thread_wait_while_user_suspended(). only the park is woken: the thread may also wait for something
+	// else, e.g. the reply to its exception, if it was suspended and resumed while it handled the exception.
+	libsimple_lock_lock(&thread->suspension_gate);
+	if (--xthread->suspend_count == 0 && thread->parked_suspended) {
+		dtape_hooks->thread_resume(thread->context);
+	}
+	libsimple_lock_unlock(&thread->suspension_gate);
 };
 
 void thread_wait(thread_t xthread, boolean_t until_not_runnable) {
 	dtape_thread_t* thread = dtape_thread_for_xnu_thread(xthread);
+	// like XNU's, this returns once the thread no longer runs user code: once it waits suspended, or while it waits
+	// for its exception to be handled. the latter matters for exception handlers that suspend the faulting thread
+	// before they reply; the thread can't take the suspension signal before it has the reply.
 	dtape_mutex_lock(&thread->suspension_mutex);
-	while (!thread->waiting_suspended) {
+	while (!thread->waiting_suspended && !thread->processing_signal) {
 		dtape_condvar_wait(&thread->suspension_condvar, &thread->suspension_mutex);
 	}
 	dtape_mutex_unlock(&thread->suspension_mutex);

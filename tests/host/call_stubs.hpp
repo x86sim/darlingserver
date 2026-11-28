@@ -144,7 +144,12 @@ namespace DarlingServer {
 		pid_t nsid() const { return _nsid; }
 		void setAddress(Address a) { address = a; }
 		void registerWithProcess() {}
-		bool setPendingCall(std::shared_ptr<Call> c) { _pendingCall = c; return true; }
+		bool rejectPendingCall = false; // as when a competing call is already pending
+		bool setPendingCall(std::shared_ptr<Call> c) {
+			if (rejectPendingCall) throw std::runtime_error("a call is already pending");
+			_pendingCall = c;
+			return true;
+		}
 		size_t _s2cStaleMappingLength = 0;
 		bool _s2cStaleMappingReusable = false;
 		void _s2cNoteStaleMapping(const Message&, size_t, bool) {}
@@ -177,6 +182,11 @@ namespace DarlingServer {
 		bool _madeByMldr = false;
 		Number number() const { return Number::Other; }
 		void processCall() {}
+		// the reply sent to a call refused before it entered a thread slot
+		inline static bool armingRefused = false;
+		inline static int basicReply = 0;
+		void markArmingRefused() { armingRefused = true; }
+		void sendBasicReply(int code) { basicReply = code; }
 		static std::shared_ptr<Call> callFromMessage(Message&& requestMessage);
 	};
 	struct DbgCall : Call {

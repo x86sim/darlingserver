@@ -54,7 +54,7 @@ void dtape_init(const dtape_hooks_t* hooks) {
 	ipc_space_zone = zone_create("ipc spaces", sizeof(struct ipc_space), ZC_NOENCRYPT);
 	ipc_kmsg_zone = zone_create("ipc kmsgs", IKM_SAVED_KMSG_SIZE, ZC_CACHING | ZC_ZFREE_CLEARMEM);
 	semaphore_zone = zone_create("semaphores", sizeof(struct semaphore), ZC_NONE);
-	dtape_ipc_eventlink_init();   // x86Sim: mach eventlinks (os_eventlink)
+	dtape_ipc_eventlink_init();   // mach eventlinks (os_eventlink)
 
 	ipc_object_zones[IOT_PORT] = zone_create("ipc ports", sizeof(struct ipc_port), ZC_NOENCRYPT | ZC_CACHING | ZC_ZFREE_CLEARMEM | ZC_NOSEQUESTER);
 	ipc_object_zones[IOT_PORT_SET] = zone_create("ipc port sets", sizeof(struct ipc_pset), ZC_NOENCRYPT | ZC_ZFREE_CLEARMEM | ZC_NOSEQUESTER);

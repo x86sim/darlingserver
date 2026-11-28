@@ -1751,7 +1751,7 @@ kern_return_t mach_vm_protect(vm_map_t map, mach_vm_offset_t start, mach_vm_size
 		return KERN_INVALID_ARGUMENT;
 	}
 
-	// x86Sim (Align 1): XNU's vm_map_protect with set_maximum only lowers (current &= new max) and never grants a
+	// XNU's vm_map_protect with set_maximum only lowers (current &= new max) and never grants a
 	// right; this set the current protection to the new maximum (vm_protect(t, a, n, TRUE, VM_PROT_ALL) made a guard
 	// page RWX). There is no maximum on Linux and the current protection of another task isn't known here cheaply:
 	// a maximum that is everything changes nothing, anything else is left as is (the in-process trap does it exactly).
@@ -1783,7 +1783,7 @@ kern_return_t mach_vm_protect(vm_map_t map, mach_vm_offset_t start, mach_vm_size
 };
 
 kern_return_t mach_vm_purgable_control(vm_map_t map, mach_vm_offset_t address, vm_purgable_t control, int* state) {
-	// x86Sim (Align 1): the MIG path (another task's map, or the trap's fallback) aborted darlingserver and with it
+	// the MIG path (another task's map, or the trap's fallback) aborted darlingserver and with it
 	// every process. Same answer as the in-process trap (libsystem_kernel mach_traps.c): nothing is ever purged here.
 	if (!state && control != VM_PURGABLE_PURGE_ALL) {
 		return KERN_INVALID_ARGUMENT;
@@ -2327,7 +2327,7 @@ kern_return_t mach_vm_remap_new_external(vm_map_t target_map, mach_vm_offset_t* 
 	}
 
 	map_addr = (vm_map_offset_t)*address;
-	
+
 	// I wasn't able to find an reimplementation of vm_map_remap in darlingserver,
 	// so we will use mach_vm_remap_external for the time being.
 	kr = mach_vm_remap_external(target_map,

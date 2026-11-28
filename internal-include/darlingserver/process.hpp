@@ -206,7 +206,7 @@ namespace DarlingServer {
 		template<typename Function>
 		auto _performS2C(Function&& function);
 
-		void _dispose();
+		void _dispose(dtape_task_t* task);
 
 		void _setEternalID(EternalID eid);
 

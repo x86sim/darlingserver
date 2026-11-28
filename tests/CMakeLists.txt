@@ -87,6 +87,14 @@ add_custom_command(
 	VERBATIM
 )
 add_custom_command(
+	OUTPUT ${gen}/guest_core_limit.inc
+	COMMAND ${CMAKE_COMMAND} -E make_directory ${gen}
+	COMMAND sh -c "\"$@\" > \"$0\"" ${gen}/guest_core_limit.inc
+		${host}/extract-static.sh ${root}/src/darlingserver.cpp guestCoreLimit
+	DEPENDS ${host}/extract-static.sh ${root}/src/darlingserver.cpp
+	VERBATIM
+)
+add_custom_command(
 	OUTPUT ${gen}/launchd_handshake.inc
 	COMMAND ${CMAKE_COMMAND} -E make_directory ${gen}
 	COMMAND sh -c "\"$@\" > \"$0\"" ${gen}/launchd_handshake.inc
@@ -156,7 +164,7 @@ add_custom_command(
 # one target per generated file, so that the tests sharing it do not generate it concurrently
 add_custom_target(dserver_test_call_inc DEPENDS ${gen}/call.inc)
 
-foreach(topic call_peer_uid call_pid_order call_push_reply_pipe call_thread_owner call_fork_checkin call_sigprocess_legacy)
+foreach(topic call_peer_uid call_pid_order call_push_reply_pipe call_thread_owner call_fork_checkin call_sigprocess_legacy call_refused_pending)
 	dserver_host_test(${topic} SOURCES ${host}/${topic}_test.cpp)
 	target_include_directories(dserver_${topic}_test PRIVATE ${host})
 	target_compile_definitions(dserver_${topic}_test PRIVATE CALL_FROM_MESSAGE_INC="${gen}/call.inc")
@@ -177,6 +185,8 @@ target_compile_definitions(dserver_prefix_preinit_test PRIVATE PREFIX_PREINIT_IN
 
 dserver_host_test(launchd_handshake SOURCES ${host}/launchd_handshake_test.cpp ${gen}/launchd_handshake.inc)
 target_compile_definitions(dserver_launchd_handshake_test PRIVATE LAUNCHD_HANDSHAKE_INC="${gen}/launchd_handshake.inc")
+dserver_host_test(guest_core_limit SOURCES ${host}/guest_core_limit_test.cpp ${gen}/guest_core_limit.inc)
+target_compile_definitions(dserver_guest_core_limit_test PRIVATE GUEST_CORE_LIMIT_INC="${gen}/guest_core_limit.inc")
 
 dserver_host_test(thread_discovery SOURCES ${host}/thread_discovery_test.cpp ${gen}/thread_discovery.inc)
 target_compile_definitions(dserver_thread_discovery_test PRIVATE THREAD_DISCOVERY_INC="${gen}/thread_discovery.inc")

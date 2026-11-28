@@ -1,4 +1,4 @@
-// x86Sim: the mach eventlink traps for darlingserver's RPC (scripts/generate-rpc-wrappers.py: mach_eventlink_*).
+// the mach eventlink traps for darlingserver's RPC (scripts/generate-rpc-wrappers.py: mach_eventlink_*).
 // XNU's (osfmk/ipc/ipc_eventlink.c, built here) do the work; their 64-bit return value (signal count | error << 56)
 // goes to the caller's `result`, as the BSD syscall's register value would.
 #include <darlingserver/duct-tape/stubs.h>
